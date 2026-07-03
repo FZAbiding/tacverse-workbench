@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""Pull one or more Hugging Face dataset repos into date-stamped folders.
+
+Datasets are re-pulled on every run (`snapshot_download` syncs incrementally,
+so newly merged files are fetched and unchanged ones are skipped). Each run
+writes everything under a per-day folder:
+
+    <out-dir>/<YYMMDD>/<dataset-name>/...             # dataset files
+    <out-dir>/<YYMMDD>/pull_result_<YYMMDD>_<HHMM>.json  # aggregate summary
+
+The list of datasets lives in DATASETS and can be overridden with repeated
+`--repo-id` flags. The fields lifted from each dataset's meta/info.json are
+declared in INFO_FIELDS, so extending the report is a one-line change.
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+from pathlib import Path
+
+# By default every dataset under this org is discovered and pulled. Override
+# with --org, or pass explicit --repo-id flags to pull a specific subset.
+ORG = "TacVerse"
+
+HF_DATASET_URL = "https://huggingface.co/datasets/{repo_id}"
+
+# Fields copied verbatim from meta/info.json into each dataset's summary.
+# Extend this list to surface more of info.json (e.g. "fps", "total_tasks",
+# "robot_type") with no other change. `key` is the output name, `source` the
+# info.json key; `required=False` skips the field for datasets that lack it.
+INFO_FIELDS = [
+    {"key": "total_episodes", "source": "total_episodes"},
+    {"key": "total_frames", "source": "total_frames"},
+    {"key": "fps", "source": "fps", "required": False},
+    {"key": "robot_type", "source": "robot_type", "required": False},
+    {"key": "total_tasks", "source": "total_tasks", "required": False},
+]
+
+# Assumed capture rate (frames per second) when a dataset's info.json omits fps.
+DEFAULT_FPS = 30
+
+
+def normalize_proxy_env() -> None:
+    """Make the shell proxy vars parseable by httpx (huggingface_hub 1.x).
+
+    httpx rejects a schemeless `socks://` proxy URL. The http(s)_proxy vars
+    already cover HTTPS traffic to the Hub, so drop the offending ALL_PROXY
+    vars and normalize any remaining socks:// value to socks5://.
+    """
+    for var in ("ALL_PROXY", "all_proxy"):
+        os.environ.pop(var, None)
+    for var in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+        val = os.environ.get(var)
+        if val and val.startswith("socks://"):
+            os.environ[var] = "socks5://" + val[len("socks://"):]
+
+
+def _apply_info(summary: dict, info: dict) -> dict:
+    """Fill INFO_FIELDS + derived duration_hours into `summary` from an info dict."""
+    for field in INFO_FIELDS:
+        src = field["source"]
+        if src in info:
+            summary[field["key"]] = info[src]
+        elif field.get("required", True):
+            summary[field["key"]] = None
+    # Recording duration in hours = frames / fps / 3600.
+    frames = summary.get("total_frames")
+    if frames is not None:
+        fps = summary.get("fps") or DEFAULT_FPS
+        summary["duration_hours"] = round(frames / fps / 3600, 3)
+    return summary
+
+
+def build_summary(repo_id: str, local_dir: str) -> dict:
+    """Assemble a per-dataset summary from a *downloaded* dataset directory.
+
+    Derived fields (name, link, local_dir) plus every entry in INFO_FIELDS read
+    from meta/info.json. Missing info.json or missing keys degrade gracefully.
+    """
+    summary = {
+        "dataset_name": repo_id,
+        "link": HF_DATASET_URL.format(repo_id=repo_id),
+        "local_dir": str(local_dir),
+    }
+    info_path = Path(local_dir) / "meta" / "info.json"
+    if info_path.is_file():
+        _apply_info(summary, json.loads(info_path.read_text()))
+    else:
+        # Not a LeRobot-style dataset (no meta/info.json); leave the
+        # info-derived fields absent rather than guessing.
+        print(f"Note: {info_path} not found; summary limited to name and link.")
+    return summary
+
+
+def fetch_summary(repo_id: str, token=None) -> dict:
+    """Summarize a dataset by fetching ONLY its meta/info.json (no full download).
+
+    Used for the stats-only path: downloads a single small file instead of the
+    whole (potentially huge) dataset. Falls back to name+link if info.json is
+    absent.
+    """
+    from huggingface_hub import hf_hub_download
+
+    summary = {
+        "dataset_name": repo_id,
+        "link": HF_DATASET_URL.format(repo_id=repo_id),
+    }
+    try:
+        info_path = hf_hub_download(
+            repo_id=repo_id,
+            filename="meta/info.json",
+            repo_type="dataset",
+            token=token,
+        )
+    except Exception:
+        return summary  # no info.json -> name+link only
+    _apply_info(summary, json.loads(Path(info_path).read_text()))
+    return summary
+
+
+def discover_datasets_meta(org, token):
+    """Return [{"id", "last_modified"}] for every dataset under an org/user.
+
+    Ordered most-recently-updated first, matching the Hugging Face org page's
+    default "Recently updated" sort. Datasets missing a timestamp sort last.
+    """
+    from huggingface_hub import list_datasets
+
+    ds = list(list_datasets(author=org, token=token))
+    ds.sort(key=lambda d: (d.last_modified is not None, d.last_modified), reverse=True)
+    out = []
+    for d in ds:
+        lm = d.last_modified
+        out.append({"id": d.id, "last_modified": lm.isoformat() if lm else None})
+    return out
+
+
+def discover_datasets(org, token):
+    """Return every dataset repo id under an org/user (recently-updated first)."""
+    return [d["id"] for d in discover_datasets_meta(org, token)]
+
+
+def fetch_uploader(repo_id, token=None):
+    """Return uploader info from the dataset's HF commit history.
+
+    `uploader` is the author of the earliest (initial) commit — i.e. who created
+    the dataset. `uploaders` lists every distinct commit author. Degrades to an
+    empty dict on any error (private repo, network, etc.).
+    """
+    from huggingface_hub import HfApi
+
+    try:
+        commits = HfApi().list_repo_commits(repo_id, repo_type="dataset", token=token)
+    except Exception:
+        return {}
+    if not commits:
+        return {}
+    # Commits come newest-first; the last one is the initial commit.
+    authors, seen = [], set()
+    for c in commits:
+        for a in (getattr(c, "authors", None) or []):
+            if a not in seen:
+                seen.add(a)
+                authors.append(a)
+    initial = commits[-1]
+    creator = (getattr(initial, "authors", None) or [None])[0]
+    last_at = getattr(commits[0], "created_at", None)
+    return {
+        "uploader": creator,
+        "uploaders": authors,
+        "last_commit_at": last_at.isoformat() if last_at else None,
+    }
+
+
+def pull_dataset(repo_id, day_dir, revision, token):
+    """Download one dataset into <day_dir>/<dataset-name> and summarize it."""
+    from huggingface_hub import snapshot_download
+
+    local_dir = Path(day_dir) / repo_id.split("/")[-1]
+    print(f"Downloading {repo_id} -> {local_dir}")
+    path = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=revision,
+        local_dir=str(local_dir),
+        token=token,
+    )
+    return build_summary(repo_id, path)
+
+
+def build_report(summaries, failures, now, org, requested):
+    """Build the aggregate report dict (totals first, then per-dataset list)."""
+    agg_episodes = sum(x.get("total_episodes") or 0 for x in summaries)
+    agg_frames = sum(x.get("total_frames") or 0 for x in summaries)
+    agg_hours = round(sum(x.get("duration_hours") or 0 for x in summaries), 3)
+    report = {
+        "total_datasets": len(summaries),
+        "total_episodes": agg_episodes,
+        "total_frames": agg_frames,
+        "total_hours": agg_hours,
+        "pulled_at": now.isoformat(timespec="seconds"),
+        "date": now.strftime("%y%m%d"),
+        "org": org,
+        "requested": requested,
+        "count": len(summaries),
+        "datasets": summaries,
+    }
+    if failures:
+        report["failures"] = failures
+    return report
+
+
+def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
+             log=print, progress=None, write_summary=True,
+             meta_map=None, with_uploader=True):
+    """Pull every repo in `repo_ids` into a per-day folder and write a report.
+
+    `log(msg)` receives human-readable progress lines (same text as the CLI).
+    `progress(done, total)` is called before and after each dataset so a UI can
+    drive a progress bar. Returns (report_dict, out_path_or_None).
+    """
+    now = now or dt.datetime.now()
+    day_dir = Path(out_dir) / now.strftime("%y%m%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    summaries, failures = [], []
+    total = len(repo_ids)
+    if progress:
+        progress(0, total)
+    for i, repo_id in enumerate(repo_ids, 1):
+        log(f"[{i}/{total}] {repo_id}")
+        try:
+            s = pull_dataset(repo_id, day_dir, revision, token)
+            _enrich(s, repo_id, meta_map, with_uploader, token)
+            summaries.append(s)
+        except Exception as exc:  # keep pulling the rest if one fails
+            log(f"ERROR pulling {repo_id}: {exc}")
+            failures.append({"dataset_name": repo_id, "error": str(exc)})
+        if progress:
+            progress(i, total)
+
+    report = build_report(summaries, failures, now, org, total)
+    out_path = None
+    if write_summary:
+        out_path = day_dir / f"pull_result_{now.strftime('%y%m%d_%H%M')}.json"
+        out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+        log(f"Wrote summary -> {out_path}")
+    return report, out_path
+
+
+def _enrich(summary, repo_id, meta_map, with_uploader, token):
+    """Attach last_modified (from meta_map) and uploader fields to a summary."""
+    if meta_map and repo_id in meta_map:
+        summary["last_modified"] = meta_map[repo_id]
+    if with_uploader:
+        summary.update(fetch_uploader(repo_id, token))
+    return summary
+
+
+def collect_stats(repo_ids, org, token=None, now=None, log=print, progress=None,
+                  meta_map=None, with_uploader=True):
+    """Build a report from meta/info.json only — no dataset files downloaded.
+
+    Same report shape as run_pull (totals + per-dataset list), so a UI can show
+    it in the exact same dashboard. Per-dataset entries have no local_dir but do
+    carry last_modified + uploader when meta_map/with_uploader are supplied.
+    """
+    now = now or dt.datetime.now()
+    summaries, failures = [], []
+    total = len(repo_ids)
+    if progress:
+        progress(0, total)
+    for i, repo_id in enumerate(repo_ids, 1):
+        log(f"[{i}/{total}] {repo_id}")
+        try:
+            s = fetch_summary(repo_id, token)
+            _enrich(s, repo_id, meta_map, with_uploader, token)
+            summaries.append(s)
+        except Exception as exc:
+            log(f"ERROR reading {repo_id}: {exc}")
+            failures.append({"dataset_name": repo_id, "error": str(exc)})
+        if progress:
+            progress(i, total)
+    return build_report(summaries, failures, now, org, total)
+
+
+def find_latest_report(out_dir):
+    """Return the newest pull_result_*.json under out_dir/*/ (or None)."""
+    files = sorted(Path(out_dir).glob("*/pull_result_*.json"))
+    return files[-1] if files else None
+
+
+# --------------------------------------------------------------------------- #
+# Analytics helpers (pure functions over report dicts — used by the GUI)
+# --------------------------------------------------------------------------- #
+def load_history(out_dir):
+    """Load every pull_result_*.json under out_dir/*/, oldest pull first."""
+    history = []
+    for f in sorted(Path(out_dir).glob("*/pull_result_*.json")):
+        try:
+            history.append(json.loads(f.read_text()))
+        except (OSError, ValueError):
+            continue
+    history.sort(key=lambda r: r.get("pulled_at", ""))
+    return history
+
+
+def daily_series(history):
+    """Collapse history to one snapshot per day (the day's last pull).
+
+    Returns a date-sorted list of {date, total_hours, total_episodes,
+    total_frames, total_datasets, cum_hours} for trend charts.
+    """
+    by_day = {}
+    for r in history:  # history is oldest-first, so later pulls overwrite
+        by_day[r.get("date", "")] = r
+    series = []
+    cum = 0.0
+    for date in sorted(k for k in by_day if k):
+        r = by_day[date]
+        cum += r.get("total_hours", 0) or 0
+        series.append({
+            "date": date,
+            "total_hours": r.get("total_hours", 0) or 0,
+            "total_episodes": r.get("total_episodes", 0) or 0,
+            "total_frames": r.get("total_frames", 0) or 0,
+            "total_datasets": r.get("total_datasets", 0) or 0,
+            "cum_hours": round(cum, 3),
+        })
+    return series
+
+
+def compute_deltas(current_report, history):
+    """Per-dataset growth of current_report vs the most recent earlier snapshot.
+
+    "Earlier" = the latest history entry with a different pulled_at. Returns
+    {dataset_name: {d_episodes, d_frames, d_hours, is_new}}. With no prior
+    snapshot every dataset is marked is_new with its full totals as the delta.
+    """
+    cur_at = current_report.get("pulled_at")
+    prior = None
+    for r in history:  # oldest-first; keep the newest that predates current
+        if r.get("pulled_at") and r["pulled_at"] < (cur_at or "￿"):
+            prior = r
+    prev = {}
+    if prior:
+        prev = {d["dataset_name"]: d for d in prior.get("datasets", [])}
+    deltas = {}
+    for d in current_report.get("datasets", []):
+        name = d["dataset_name"]
+        p = prev.get(name)
+        deltas[name] = {
+            "d_episodes": (d.get("total_episodes") or 0) - (p.get("total_episodes") or 0 if p else 0),
+            "d_frames": (d.get("total_frames") or 0) - (p.get("total_frames") or 0 if p else 0),
+            "d_hours": round((d.get("duration_hours") or 0) - (p.get("duration_hours") or 0 if p else 0), 3),
+            "is_new": p is None,
+        }
+    return deltas
+
+
+def task_prefix(dataset_name):
+    """Derive a task label: drop the owner and a trailing -MMDD date suffix.
+
+    e.g. 'TacVerse/taccap-g1-pepper-0703' -> 'taccap-g1-pepper'.
+    """
+    name = dataset_name.split("/")[-1]
+    parts = name.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 4:
+        return parts[0]
+    return name
+
+
+def rollup(datasets, key_fn):
+    """Group datasets by key_fn(d) and sum count/episodes/frames/hours.
+
+    Returns a list of {group, count, episodes, frames, hours, pct_hours} sorted
+    by hours descending. pct_hours is each group's share of total hours.
+    """
+    groups = {}
+    for d in datasets:
+        key = key_fn(d) or "—"
+        g = groups.setdefault(
+            key, {"group": key, "count": 0, "episodes": 0, "frames": 0, "hours": 0.0})
+        g["count"] += 1
+        g["episodes"] += d.get("total_episodes") or 0
+        g["frames"] += d.get("total_frames") or 0
+        g["hours"] += d.get("duration_hours") or 0
+    total_hours = sum(g["hours"] for g in groups.values()) or 1
+    rows = sorted(groups.values(), key=lambda g: g["hours"], reverse=True)
+    for g in rows:
+        g["hours"] = round(g["hours"], 3)
+        g["pct_hours"] = round(100 * g["hours"] / total_hours, 1)
+    return rows
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Pull HF datasets into date-stamped folders."
+    )
+    parser.add_argument(
+        "--org",
+        default=ORG,
+        help=f"Pull every dataset under this org/user (default: {ORG})",
+    )
+    parser.add_argument(
+        "--repo-id",
+        action="append",
+        dest="repo_ids",
+        metavar="OWNER/NAME",
+        help="Pull only these datasets (repeat); overrides --org discovery",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default="pulls",
+        help="Base directory; a per-day <YYMMDD> subfolder is created inside",
+    )
+    parser.add_argument("--revision", default=None, help="Branch, tag, or commit")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("HF_TOKEN"),
+        help="HF access token (defaults to $HF_TOKEN or the cached login token)",
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="Download only; skip writing the summary file",
+    )
+    args = parser.parse_args()
+
+    normalize_proxy_env()
+
+    try:
+        import huggingface_hub  # noqa: F401  (imported for the clear error below)
+    except ImportError:
+        sys.exit(
+            "huggingface_hub is not installed.\n"
+            "Install it with:  pip install huggingface_hub"
+        )
+
+    meta_map = None
+    if args.repo_ids:
+        repo_ids = args.repo_ids
+    else:
+        print(f"Discovering datasets under '{args.org}' ...")
+        meta = discover_datasets_meta(args.org, args.token)
+        repo_ids = [m["id"] for m in meta]
+        meta_map = {m["id"]: m["last_modified"] for m in meta}
+        print(f"Found {len(repo_ids)} datasets.")
+    if not repo_ids:
+        sys.exit(f"No datasets to pull (org '{args.org}' returned nothing).")
+
+    report, _ = run_pull(
+        repo_ids,
+        out_dir=args.out_dir,
+        org=args.org,
+        revision=args.revision,
+        token=args.token,
+        write_summary=not args.no_summary,
+        meta_map=meta_map,
+    )
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 1 if report.get("failures") else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

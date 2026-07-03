@@ -1,0 +1,18 @@
+# Pulled datasets (large: multi-GB video data) — never commit
+pulls/
+
+# Python virtual env / caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime logs
+*.log
+
+# Local Claude/editor settings
+.claude/
+.vscode/
+.idea/
+
+# HF cache (if ever created here)
+.cache/
