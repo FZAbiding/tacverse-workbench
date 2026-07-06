@@ -35,6 +35,26 @@ import download_dataset as dd
 OUT_DIR = "pulls"
 RECENT_ORGS = ["TacVerse", "Xense"]  # seeds the editable org combo
 
+# HF uploader id -> human (Chinese) name. Edit uploader_names.json to add people;
+# ids with no entry render as 未知. Resolved relative to this file so it works
+# regardless of the process's working directory.
+UPLOADER_NAMES_FILE = Path(__file__).parent / "uploader_names.json"
+
+
+def load_uploader_names():
+    try:
+        return json.loads(UPLOADER_NAMES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+_UPLOADER_NAMES = load_uploader_names()
+
+
+def uploader_cn(hf_id):
+    """Map an HF uploader id to its Chinese name, or 未知 if absent/unknown."""
+    return _UPLOADER_NAMES.get(hf_id, "未知") if hf_id else "未知"
+
 pg.setConfigOptions(background="w", foreground="k", antialias=True)
 
 # Dashboard table columns: (header, dataset key, kind). "__delta__" is special.
@@ -46,16 +66,39 @@ TABLE_COLS = [
     ("fps", "fps", "num"),
     ("robot_type", "robot_type", "str"),
     ("任务数", "total_tasks", "num"),
-    ("上传者", "uploader", "str"),
+    ("HF ID", "uploader", "str"),
+    ("上传者", "__uploader_cn__", "str"),
     ("最后更新", "last_modified", "date"),
     ("今日新增ep", "__delta__", "num"),
 ]
 
+# Column that carries last_modified — the table's default sort key. Derived so it
+# stays correct if columns are inserted/reordered above.
+DATE_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "last_modified")
+
 ROLLUP_DIMS = {
     "robot_type": lambda d: d.get("robot_type"),
-    "上传者": lambda d: d.get("uploader"),
+    "上传者": lambda d: uploader_cn(d.get("uploader")),
     "任务": lambda d: dd.task_prefix(d["dataset_name"]),
 }
+
+
+def fmt_day(yymmdd):
+    """'260703' -> '2026-07-03'. Returns the input unchanged if unparseable."""
+    try:
+        return dt.datetime.strptime(yymmdd, "%y%m%d").strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return yymmdd or "—"
+
+
+def days_between(yymmdd_from, yymmdd_to):
+    """Whole days from one YYMMDD date to another, or None if either is unparseable."""
+    try:
+        a = dt.datetime.strptime(yymmdd_from, "%y%m%d")
+        b = dt.datetime.strptime(yymmdd_to, "%y%m%d")
+        return (b - a).days
+    except (ValueError, TypeError):
+        return None
 
 
 def fmt_value(v):
@@ -242,15 +285,40 @@ class MainWindow(QWidget):
         self.org_combo.setMinimumWidth(160)
         top.addWidget(self.org_combo)
 
-        self.btn_pull = QPushButton("拉取当前数据集")
+        # Two primary actions, statistics first (fast, read-only) then the full
+        # pull. They get a bold colored look; the utilities that follow stay plain
+        # and sit behind a vertical divider so the split reads at a glance.
         self.btn_stats = QPushButton("统计当前数据集")
+        self.btn_pull = QPushButton("拉取当前数据集")
         self.btn_check = QPushButton("检查新增数据集")
         self.btn_open = QPushButton("打开本地目录")
-        self.btn_pull.clicked.connect(self.on_pull)
         self.btn_stats.clicked.connect(self.on_stats)
+        self.btn_pull.clicked.connect(self.on_pull)
         self.btn_check.clicked.connect(self.on_check)
         self.btn_open.clicked.connect(self.on_open_dir)
-        for b in (self.btn_pull, self.btn_stats, self.btn_check, self.btn_open):
+
+        primary_css = (
+            "QPushButton { font-weight: bold; padding: 6px 16px; border-radius: 6px;"
+            " color: white; background: %s; }"
+            "QPushButton:hover { background: %s; }"
+            "QPushButton:disabled { background: #B0B0B0; }"
+        )
+        self.btn_stats.setStyleSheet(primary_css % ("#34A853", "#2E9247"))
+        self.btn_pull.setStyleSheet(primary_css % ("#4C8BF5", "#3B7AE0"))
+        secondary_css = (
+            "QPushButton { padding: 5px 12px; border-radius: 6px; color: #444;"
+            " border: 1px solid #C4C4C4; background: #F5F5F5; }"
+            "QPushButton:hover { background: #ECECEC; }"
+        )
+        for b in (self.btn_stats, self.btn_pull):
+            b.setMinimumHeight(34)
+            top.addWidget(b)
+        divider = QFrame()
+        divider.setFrameShape(QFrame.VLine)
+        divider.setFrameShadow(QFrame.Sunken)
+        top.addWidget(divider)
+        for b in (self.btn_check, self.btn_open):
+            b.setStyleSheet(secondary_css)
             top.addWidget(b)
         top.addSpacing(16)
         top.addWidget(QLabel("每日目标(小时):"))
@@ -296,6 +364,11 @@ class MainWindow(QWidget):
         ]:
             cards.addWidget(self._make_card(key, title))
         v.addLayout(cards)
+
+        # Which earlier pull the "今日新增" figures are measured against.
+        self.baseline_hint = QLabel("")
+        self.baseline_hint.setStyleSheet("color: #888; font-size: 12px;")
+        v.addWidget(self.baseline_hint)
 
         # Filter box
         filt = QHBoxLayout()
@@ -387,12 +460,27 @@ class MainWindow(QWidget):
             return {}
         return dd.compute_deltas(self.report, self.history)
 
+    def _refresh_baseline_hint(self):
+        """Spell out which earlier pull the「今日新增」figures are compared against."""
+        base = dd.find_baseline(self.report, self.history) if self.report else None
+        if not base:
+            self.baseline_hint.setText(
+                "「今日新增」暂无历史基准 —— 这是首次拉取，下方增量即为全部总量。")
+            return
+        day = fmt_day(base.get("date"))
+        gap = days_between(base.get("date"), (self.report or {}).get("date"))
+        ago = f"（{gap} 天前）" if gap else ""
+        self.baseline_hint.setText(
+            f"「今日新增」= 相较于 {day}{ago} 最近一次拉取结果的增量。")
+
     def _refresh_kpis(self):
         r = self.report
         if not r:
             for lbl in self.kpi_labels.values():
                 lbl.setText("—")
+            self.baseline_hint.setText("")
             return
+        self._refresh_baseline_hint()
         deltas = self._current_deltas()
         new_hours = round(sum(d["d_hours"] for d in deltas.values()), 2)
         new_eps = sum(d["d_episodes"] for d in deltas.values())
@@ -417,12 +505,18 @@ class MainWindow(QWidget):
                     n = dv.get("d_episodes", 0)
                     txt = ("🆕 " if dv.get("is_new") else "") + (f"+{n}" if n else "0")
                     item = NumericItem(txt, n)
+                elif key == "__uploader_cn__":
+                    item = QTableWidgetItem(uploader_cn(d.get("uploader")))
                 elif kind == "num":
                     v = d.get(key)
                     item = NumericItem(fmt_value(v), v if isinstance(v, (int, float)) else -1)
                 elif kind == "date":
                     v = d.get(key) or ""
-                    item = QTableWidgetItem(v[:10] if v else "—")
+                    # Show day granularity but sort by the full ISO timestamp
+                    # (ISO strings sort chronologically), so the default 最后更新↓
+                    # order reproduces HF's "Recently updated" ranking — same-day
+                    # datasets keep their real order instead of shuffling.
+                    item = NumericItem(v[:10] if v else "—", v or "")
                 else:
                     item = QTableWidgetItem(fmt_value(d.get(key)))
                 if col == 0:
@@ -430,7 +524,7 @@ class MainWindow(QWidget):
                 self.table.setItem(row, col, item)
         self.table.setSortingEnabled(True)
         # Default order: most-recently-updated first (matches org page / 发现顺序).
-        self.table.sortItems(8, Qt.DescendingOrder)
+        self.table.sortItems(DATE_COL, Qt.DescendingOrder)
         self.table_hint.setText(
             f"共 {len(datasets)} 个数据集，双击行打开 HF 页面；点表头排序。"
             if datasets else "点「统计当前数据集」加载数据集列表。")
@@ -442,6 +536,7 @@ class MainWindow(QWidget):
             d = self.table.item(row, 0).data(Qt.UserRole) or {}
             hay = " ".join(str(d.get(k, "")) for k in
                            ("dataset_name", "robot_type", "uploader")).lower()
+            hay += " " + uploader_cn(d.get("uploader")).lower()
             self.table.setRowHidden(row, bool(q) and q not in hay)
 
     def _open_row_link(self, row, _col):

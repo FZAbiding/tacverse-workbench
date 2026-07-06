@@ -128,7 +128,10 @@ def discover_datasets_meta(org, token):
     """
     from huggingface_hub import list_datasets
 
-    ds = list(list_datasets(author=org, token=token))
+    # Ask the Hub for its own "Recently updated" ranking (sort by lastModified,
+    # newest first) so our order matches the org page exactly. The client-side
+    # sort below is a stable fallback that also pins timestamp-less repos last.
+    ds = list(list_datasets(author=org, token=token, sort="lastModified", direction=-1))
     ds.sort(key=lambda d: (d.last_modified is not None, d.last_modified), reverse=True)
     out = []
     for d in ds:
@@ -332,18 +335,33 @@ def daily_series(history):
     return series
 
 
-def compute_deltas(current_report, history):
-    """Per-dataset growth of current_report vs the most recent earlier snapshot.
+def find_baseline(current_report, history):
+    """Return the snapshot to diff `current_report` against: the last pull of the
+    most recent *earlier day*.
 
-    "Earlier" = the latest history entry with a different pulled_at. Returns
-    {dataset_name: {d_episodes, d_frames, d_hours, is_new}}. With no prior
+    "今日新增" is measured against the previous pull DAY, not merely the previous
+    pull — so multiple pulls on the same day all compare back to that earlier day.
+    `history` is oldest-first, so the last entry whose date precedes the current
+    report's date is that day's final pull. Returns None when no earlier day
+    exists (the current report is the first ever).
+    """
+    cur_date = current_report.get("date") or ""
+    prior = None
+    for r in history:  # oldest-first; last match = newest earlier-day pull
+        rd = r.get("date") or ""
+        if rd and rd < cur_date:
+            prior = r
+    return prior
+
+
+def compute_deltas(current_report, history):
+    """Per-dataset growth of current_report vs the previous pull day's snapshot.
+
+    Baseline = find_baseline(current_report, history). Returns
+    {dataset_name: {d_episodes, d_frames, d_hours, is_new}}. With no earlier-day
     snapshot every dataset is marked is_new with its full totals as the delta.
     """
-    cur_at = current_report.get("pulled_at")
-    prior = None
-    for r in history:  # oldest-first; keep the newest that predates current
-        if r.get("pulled_at") and r["pulled_at"] < (cur_at or "￿"):
-            prior = r
+    prior = find_baseline(current_report, history)
     prev = {}
     if prior:
         prev = {d["dataset_name"]: d for d in prior.get("datasets", [])}
