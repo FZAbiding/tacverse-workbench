@@ -1,4 +1,6 @@
-# Pulled datasets (large: multi-GB video data) — never commit
+# Pulled datasets are huge (multi-GB video/parquet) — never commit the raw data.
+# The lightweight collection history (每日新增 / 趋势) lives in the git-committed
+# root file ./pull_history.json instead, so a clone gets history without pulls/.
 pulls/
 
 # Python virtual env / caches

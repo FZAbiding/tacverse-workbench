@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""PySide6 team dashboard for embodied-AI dataset collection on Hugging Face.
+"""TacVerse 多模态物理具身数据集工作台 — PySide6 dashboard over Hugging Face.
 
 Wraps the logic in download_dataset.py. Top bar (org combo + actions + progress
 + speed) is shared; below it a tabbed dashboard:
 
-  * 看板   -> KPI cards + filterable, sortable dataset table.
+  * 看板   -> KPI cards (+ today's MVP) + filterable, sortable dataset table.
   * 趋势   -> daily new-hours bar + cumulative-hours line (pyqtgraph).
-  * 分组统计 -> rollup by robot_type / uploader / task, table + bar.
+  * 分组统计 -> rollup by uploader / task / robot_type, table + horizontal bars.
 
-Buttons: 拉取当前数据集 (download) / 统计当前数据集 (stats only, no download) /
-检查新增数据集 (name diff) / 打开本地目录.
+Buttons: 统计当前数据集 (stats only, no download) / 拉取当前数据集 (download) /
+检查新增数据集 (name diff) / 打开本地目录 / 切换账号 (swap HF token).
 
-Run in the lerobot-xense env:  python gui_app.py
+Run in the lerobot-xense env:  python main_app.py
 """
 
 import datetime as dt
@@ -35,25 +35,33 @@ import download_dataset as dd
 OUT_DIR = "pulls"
 RECENT_ORGS = ["TacVerse", "Xense"]  # seeds the editable org combo
 
-# HF uploader id -> human (Chinese) name. Edit uploader_names.json to add people;
-# ids with no entry render as 未知. Resolved relative to this file so it works
-# regardless of the process's working directory.
-UPLOADER_NAMES_FILE = Path(__file__).parent / "uploader_names.json"
-
-
-def load_uploader_names():
-    try:
-        return json.loads(UPLOADER_NAMES_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-_UPLOADER_NAMES = load_uploader_names()
+# HF uploader id -> Chinese name lives in the unified config.json ("uploader_names"
+# section — edit that to add people). Ids with no entry render as 未知. Loaded once
+# at startup; edit the file then restart to pick up new names.
+_UPLOADER_NAMES = dd.load_uploader_names()
 
 
 def uploader_cn(hf_id):
     """Map an HF uploader id to its Chinese name, or 未知 if absent/unknown."""
     return _UPLOADER_NAMES.get(hf_id, "未知") if hf_id else "未知"
+
+
+def resolve_token():
+    """HF token to talk to the Hub with.
+
+    Prefer $HF_TOKEN, but fall back to the token cached by `huggingface-cli
+    login` so a normal login "just works" without exporting anything. Private
+    datasets are only visible when this token belongs to an org member — e.g.
+    log in as a TacVerse member to see TacVerse's private repos.
+    """
+    tok = os.environ.get("HF_TOKEN")
+    if tok:
+        return tok
+    try:
+        from huggingface_hub import get_token
+        return get_token()
+    except Exception:
+        return None
 
 pg.setConfigOptions(background="w", foreground="k", antialias=True)
 
@@ -63,6 +71,7 @@ TABLE_COLS = [
     ("episodes", "total_episodes", "num"),
     ("frames", "total_frames", "num"),
     ("小时", "duration_hours", "num"),
+    ("均时长(s)", "__avg_sec__", "num"),  # avg seconds/episode — quality signal
     ("fps", "fps", "num"),
     ("robot_type", "robot_type", "str"),
     ("任务数", "total_tasks", "num"),
@@ -76,10 +85,11 @@ TABLE_COLS = [
 # stays correct if columns are inserted/reordered above.
 DATE_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "last_modified")
 
+# Order = dropdown order; first entry (上传者) is the default. robot_type last.
 ROLLUP_DIMS = {
-    "robot_type": lambda d: d.get("robot_type"),
     "上传者": lambda d: uploader_cn(d.get("uploader")),
     "任务": lambda d: dd.task_prefix(d["dataset_name"]),
+    "robot_type": lambda d: d.get("robot_type"),
 }
 
 
@@ -245,18 +255,46 @@ class CheckWorker(QThread):
             self.error.emit(str(exc))
 
 
+class IdentityWorker(QThread):
+    """Resolve who the current token logs in as and how many org datasets it can
+    see — so the status bar can flag token/permission problems at a glance."""
+
+    done = Signal(str, bool, str, int)  # username, has_token, org, count(-1=err)
+
+    def __init__(self, org, token):
+        super().__init__()
+        self.org, self.token = org, token
+
+    def run(self):
+        dd.normalize_proxy_env()
+        name = ""
+        if self.token:
+            try:
+                from huggingface_hub import HfApi
+                name = HfApi().whoami(token=self.token).get("name", "") or ""
+            except Exception:
+                name = ""  # token present but invalid/expired
+        try:
+            count = len(dd.discover_datasets_meta(self.org, self.token))
+        except Exception:
+            count = -1
+        self.done.emit(name, bool(self.token), self.org, count)
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HF 具身数据采集看板")
+        self.setWindowTitle("TacVerse 多模态物理具身数据集工作台")
         self.resize(1080, 720)
-        self.token = os.environ.get("HF_TOKEN")
+        self.token = resolve_token()
         self.worker = None
         self.report = None
         self.history = []
+        self._id_workers = []  # in-flight IdentityWorkers (kept alive until done)
+        self._id_seq = 0       # monotonic id; only the latest check may update UI
 
         self._build_ui()
 
@@ -272,6 +310,7 @@ class MainWindow(QWidget):
         self.history = dd.load_history(OUT_DIR)
         self._refresh_trends()
         self.status.setText("就绪，请选择「统计当前数据集」(快) 或「拉取当前数据集」。")
+        self._refresh_identity()  # populate the login/visibility indicator
 
     # ---- UI construction -------------------------------------------------- #
     def _build_ui(self):
@@ -283,6 +322,8 @@ class MainWindow(QWidget):
         self.org_combo.setEditable(True)
         self.org_combo.addItems(RECENT_ORGS)
         self.org_combo.setMinimumWidth(160)
+        self.org_combo.currentIndexChanged.connect(self._refresh_identity)
+        self.org_combo.lineEdit().editingFinished.connect(self._refresh_identity)
         top.addWidget(self.org_combo)
 
         # Two primary actions, statistics first (fast, read-only) then the full
@@ -324,10 +365,20 @@ class MainWindow(QWidget):
         top.addWidget(QLabel("每日目标(小时):"))
         self.target_spin = QSpinBox()
         self.target_spin.setRange(0, 100000)
-        self.target_spin.setValue(8)
+        self.target_spin.setValue(10)
         self.target_spin.valueChanged.connect(self._refresh_kpis)
         top.addWidget(self.target_spin)
         top.addStretch()
+        self.btn_account = QPushButton("切换账号")
+        self.btn_account.setStyleSheet(secondary_css)
+        self.btn_account.clicked.connect(self.on_switch_account)
+        top.addWidget(self.btn_account)
+        # Login / visibility indicator — surfaces token & org-permission problems
+        # (e.g. "未登录(匿名) · TacVerse 可见 11 个") without any digging.
+        self.identity_label = QLabel("登录状态: 检测中…")
+        self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.identity_label.setStyleSheet("color:#888;")
+        top.addWidget(self.identity_label)
         root.addLayout(top)
 
         self.tabs = QTabWidget()
@@ -359,10 +410,12 @@ class MainWindow(QWidget):
         cards = QHBoxLayout()
         for key, title in [
             ("total_datasets", "数据集总数"), ("total_hours", "总小时数"),
+            ("total_episodes", "总 episodes"),
             ("new_hours", "今日新增小时"), ("new_episodes", "今日新增episodes"),
             ("completion", "目标完成度"),
         ]:
             cards.addWidget(self._make_card(key, title))
+        cards.addWidget(self._make_mvp_card())
         v.addLayout(cards)
 
         # Which earlier pull the "今日新增" figures are measured against.
@@ -408,6 +461,24 @@ class MainWindow(QWidget):
         cv.addWidget(t)
         cv.addWidget(val)
         self.kpi_labels[key] = val
+        return card
+
+    def _make_mvp_card(self):
+        """Special card: today's top contributor (by new hours) + their tallies."""
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        cv = QVBoxLayout(card)
+        t = QLabel("今日 MVP ⭐")
+        t.setStyleSheet("color: #666; font-size: 12px;")
+        self.mvp_name_lbl = QLabel("—")
+        self.mvp_name_lbl.setStyleSheet(
+            "font-size: 22px; font-weight: bold; color:#F9A825;")
+        self.mvp_name_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.mvp_sub_lbl = QLabel("")
+        self.mvp_sub_lbl.setStyleSheet("color:#888; font-size: 11px;")
+        cv.addWidget(t)
+        cv.addWidget(self.mvp_name_lbl)
+        cv.addWidget(self.mvp_sub_lbl)
         return card
 
     def _build_trends_tab(self):
@@ -479,18 +550,45 @@ class MainWindow(QWidget):
             for lbl in self.kpi_labels.values():
                 lbl.setText("—")
             self.baseline_hint.setText("")
+            self.mvp_name_lbl.setText("—")
+            self.mvp_sub_lbl.setText("")
             return
         self._refresh_baseline_hint()
         deltas = self._current_deltas()
+        self._refresh_mvp(deltas)
         new_hours = round(sum(d["d_hours"] for d in deltas.values()), 2)
         new_eps = sum(d["d_episodes"] for d in deltas.values())
         target = self.target_spin.value()
         pct = f"{round(100 * new_hours / target)}%" if target else "—"
         self.kpi_labels["total_datasets"].setText(fmt_value(r.get("total_datasets")))
         self.kpi_labels["total_hours"].setText(fmt_value(r.get("total_hours")))
+        self.kpi_labels["total_episodes"].setText(fmt_value(r.get("total_episodes")))
         self.kpi_labels["new_hours"].setText(f"+{new_hours}")
         self.kpi_labels["new_episodes"].setText(f"+{fmt_value(new_eps)}")
         self.kpi_labels["completion"].setText(pct)
+
+    def _refresh_mvp(self, deltas):
+        """Today's MVP = the person whose datasets added the most new hours today.
+
+        Attributes each dataset's 今日新增 (delta) to its uploader's Chinese name,
+        then picks the top by hours. Shows their hours + episodes underneath.
+        """
+        by_person = {}
+        for d in (self.report.get("datasets", []) if self.report else []):
+            dv = deltas.get(d["dataset_name"], {})
+            agg = by_person.setdefault(uploader_cn(d.get("uploader")),
+                                       {"hours": 0.0, "eps": 0})
+            agg["hours"] += dv.get("d_hours", 0) or 0
+            agg["eps"] += dv.get("d_episodes", 0) or 0
+        top = max(by_person.items(), key=lambda kv: kv[1]["hours"], default=None)
+        if not top or top[1]["hours"] <= 0:
+            self.mvp_name_lbl.setText("—")
+            self.mvp_sub_lbl.setText("今日暂无新增贡献")
+            return
+        name, agg = top
+        self.mvp_name_lbl.setText(name)
+        self.mvp_sub_lbl.setText(
+            f"{round(agg['hours'], 2)} 小时 · {fmt_value(agg['eps'])} episodes")
 
     def _refresh_table(self):
         r = self.report
@@ -505,6 +603,11 @@ class MainWindow(QWidget):
                     n = dv.get("d_episodes", 0)
                     txt = ("🆕 " if dv.get("is_new") else "") + (f"+{n}" if n else "0")
                     item = NumericItem(txt, n)
+                elif key == "__avg_sec__":
+                    eps = d.get("total_episodes") or 0
+                    hrs = d.get("duration_hours") or 0
+                    v = round(hrs * 3600 / eps, 1) if eps else 0
+                    item = NumericItem(fmt_value(v), v)
                 elif key == "__uploader_cn__":
                     item = QTableWidgetItem(uploader_cn(d.get("uploader")))
                 elif kind == "num":
@@ -555,17 +658,21 @@ class MainWindow(QWidget):
             return
         self.trend_hint.setText(
             "" if len(series) >= 2 else "当前仅 1 天数据，多日拉取后可见增长趋势。")
+        # Categorical x = only days that were actually pulled, packed side by side
+        # (未统计的日期不占位，不留空白). fmt_day makes labels read 07-03 not 260703.
         x = list(range(len(series)))
-        dates = [s["date"] for s in series]
-        ticks = [list(zip(x, dates))]
+        labels = [fmt_day(s["date"])[5:] for s in series]  # MM-DD
+        ticks = [list(zip(x, labels))]
         bg = pg.BarGraphItem(x=x, height=[s["total_hours"] for s in series],
-                             width=0.6, brush="#4C8BF5")
+                             width=0.8, brush="#4C8BF5")
         self.daily_plot.addItem(bg)
         self.daily_plot.getAxis("bottom").setTicks(ticks)
+        self.daily_plot.setXRange(-0.5, len(series) - 0.5, padding=0)
         self.cum_plot.plot(x, [s["cum_hours"] for s in series],
                            pen=pg.mkPen("#34A853", width=2), symbol="o",
                            symbolBrush="#34A853")
         self.cum_plot.getAxis("bottom").setTicks(ticks)
+        self.cum_plot.setXRange(-0.5, len(series) - 0.5, padding=0.02)
 
     def _refresh_rollup(self):
         self.rollup_table.setRowCount(0)
@@ -583,12 +690,132 @@ class MainWindow(QWidget):
                 else:
                     item = NumericItem(fmt_value(v), v)
                 self.rollup_table.setItem(i, j, item)
-        x = list(range(len(rows)))
-        bg = pg.BarGraphItem(x=x, height=[g["hours"] for g in rows],
-                             width=0.6, brush="#F9A825")
+        # Horizontal bars: one row per group so the labels (中文名 / 任务名) read
+        # left-to-right and never overlap, however many groups there are. Cap the
+        # chart to the top 20 by hours (the table above still lists them all).
+        plot_rows = rows[:20]
+        n = len(plot_rows)
+        ys = [n - 1 - i for i in range(n)]  # rows are hours-desc -> largest on top
+        bg = pg.BarGraphItem(x0=0, y=ys, height=0.7,
+                             width=[g["hours"] for g in plot_rows], brush="#F9A825")
         self.rollup_plot.addItem(bg)
-        self.rollup_plot.getAxis("bottom").setTicks(
-            [list(zip(x, [g["group"] for g in rows]))])
+
+        def _short(s, k=24):
+            s = str(s)
+            return s if len(s) <= k else s[:k - 1] + "…"
+
+        labels = [_short(g["group"]) for g in plot_rows]
+        left = self.rollup_plot.getAxis("left")
+        left.setTicks([[(ys[i], labels[i]) for i in range(n)]])
+        # Widen the y-axis to the longest label so nothing is clipped; CJK glyphs
+        # take ~2x the width of a latin char, so weight them double when sizing.
+        vis = max((sum(2 if ord(c) > 0x2E80 else 1 for c in s) for s in labels),
+                  default=8)
+        left.setWidth(min(300, max(70, 12 + vis * 8)))
+        self.rollup_plot.getAxis("bottom").setTicks(None)  # auto numeric hour scale
+        self.rollup_plot.setYRange(-0.5, n - 0.5, padding=0.02)
+        max_h = max((g["hours"] for g in plot_rows), default=1) or 1
+        self.rollup_plot.setXRange(0, max_h, padding=0.05)  # bars start at 0, no left gap
+        self.rollup_plot.setTitle(
+            f"各分组小时数（前 {n}/{len(rows)}）" if len(rows) > n else "各分组小时数")
+
+    # ---- Login / visibility indicator ------------------------------------- #
+    def on_switch_account(self):
+        """Prompt for an account label + HF token, apply it, and re-check identity.
+
+        The token is what actually authenticates; the account field is just a
+        note (the real login name is confirmed by whoami in the indicator). The
+        token is kept in memory for this session only — it is never written to
+        disk. For a persistent login use `huggingface-cli login` or $HF_TOKEN.
+        """
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("切换账号 / Token")
+        dlg.setMinimumWidth(440)
+        form = QFormLayout(dlg)
+
+        acc_edit = QLineEdit()
+        acc_edit.setPlaceholderText("可留空，登录后会自动从 token 识别真实账号")
+        tok_edit = QLineEdit()
+        tok_edit.setPlaceholderText("hf_… 粘贴 HF access token")
+        tok_edit.setEchoMode(QLineEdit.Password)
+        show_btn = QPushButton("显示")
+        show_btn.setCheckable(True)
+        show_btn.setFixedWidth(48)
+        show_btn.toggled.connect(
+            lambda on: tok_edit.setEchoMode(
+                QLineEdit.Normal if on else QLineEdit.Password))
+        tok_row = QHBoxLayout()
+        tok_row.setContentsMargins(0, 0, 0, 0)
+        tok_row.addWidget(tok_edit, 1)
+        tok_row.addWidget(show_btn)
+        tok_wrap = QWidget()
+        tok_wrap.setLayout(tok_row)
+
+        form.addRow("账号(选填):", acc_edit)
+        form.addRow("Token:", tok_wrap)
+        hint = QLabel("Token 仅本次运行有效，不会写入磁盘。需长期生效请用 "
+                      "huggingface-cli login。")
+        hint.setStyleSheet("color:#888; font-size:12px;")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+        token = tok_edit.text().strip()
+        if not token:
+            QMessageBox.warning(self, "提示", "Token 不能为空。")
+            return
+        self.token = token
+        acc = acc_edit.text().strip()
+        self.status.setText(
+            f"已应用新 Token{'（'+acc+'）' if acc else ''}，正在校验身份与可见数量 ...")
+        self._refresh_identity()
+
+    def _refresh_identity(self, *_):
+        """Kick off a background check of who we are + how many datasets we see."""
+        org = self.org_combo.currentText().strip()
+        if not org:
+            return
+        self.identity_label.setText("登录状态: 检测中…")
+        self.identity_label.setStyleSheet("color:#888;")
+        self._id_seq += 1
+        seq = self._id_seq
+        w = IdentityWorker(org, self.token)
+        w.done.connect(lambda name, has, o, cnt, seq=seq:
+                       self._on_identity(seq, name, has, o, cnt))
+        w.finished.connect(lambda w=w: self._id_workers.remove(w)
+                           if w in self._id_workers else None)
+        self._id_workers.append(w)  # hold a ref so the QThread isn't GC'd mid-run
+        w.start()
+
+    def _on_identity(self, seq, name, has_token, org, count):
+        # Only the most recent check may update the label — a slower older worker
+        # (e.g. the startup one) must not clobber a fresh account-switch result.
+        if seq != self._id_seq:
+            return
+        cnt = f"可见 {count} 个数据集" if count >= 0 else "数据集数查询失败"
+        if not has_token:
+            who, color = "未登录(匿名)", "#F9A825"
+        elif name:
+            who, color = f"已登录: {name}", "#34A853"
+        else:
+            who, color = "已登录: token 无效/过期", "#EA4335"
+        self.identity_label.setText(f"{who} · {org} {cnt}")
+        self.identity_label.setStyleSheet(f"color:{color}; font-weight:bold;")
+
+    def closeEvent(self, event):
+        # Let any in-flight identity checks finish so the QThread isn't destroyed
+        # mid-run (Qt would otherwise warn / crash on close during a check).
+        for w in list(self._id_workers):
+            w.wait(2000)
+        super().closeEvent(event)
 
     # ---- Button handlers -------------------------------------------------- #
     def _set_busy(self, busy):

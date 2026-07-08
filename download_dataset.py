@@ -250,6 +250,11 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
         out_path = day_dir / f"pull_result_{now.strftime('%y%m%d_%H%M')}.json"
         out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         log(f"Wrote summary -> {out_path}")
+    try:
+        append_history(report)  # git-committed history; survives pulls/ being ignored
+        log(f"Updated history -> {CONFIG_FILE}")
+    except OSError as exc:
+        log(f"WARN: could not update {CONFIG_FILE}: {exc}")
     return report, out_path
 
 
@@ -298,14 +303,86 @@ def find_latest_report(out_dir):
 # --------------------------------------------------------------------------- #
 # Analytics helpers (pure functions over report dicts — used by the GUI)
 # --------------------------------------------------------------------------- #
-def load_history(out_dir):
-    """Load every pull_result_*.json under out_dir/*/, oldest pull first."""
-    history = []
+# Single git-committed config file at the repo root. Holds BOTH the hand-edited
+# uploader id->name map AND the auto-appended pull history, so the project keeps
+# only one json to maintain. It travels with the code — a fresh clone gets the
+# collection trend / 每日新增 WITHOUT syncing the multi-GB pulls/ folder (ignored).
+#
+#   { "uploader_names": { "<hf_id>": "<中文名>", ... },   # you edit this
+#     "pull_history":  [ {trimmed pull snapshot}, ... ] }  # the app appends this
+CONFIG_FILE = str(Path(__file__).parent / "config.json")
+
+# Per-dataset fields kept in the lightweight history (drop link/local_dir paths).
+_HISTORY_DS_FIELDS = (
+    "dataset_name", "total_episodes", "total_frames", "duration_hours",
+    "fps", "robot_type", "total_tasks", "uploader", "last_modified",
+)
+
+
+def load_config(path=CONFIG_FILE):
+    """Read the unified config; returns {} (never raises) if missing/corrupt."""
+    try:
+        cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_uploader_names(path=CONFIG_FILE):
+    """The hand-edited HF id -> Chinese name map from the config file."""
+    return load_config(path).get("uploader_names", {}) or {}
+
+
+def _trim_report(report):
+    """A compact, path-free copy of a report for the history in the config file."""
+    return {
+        "pulled_at": report.get("pulled_at"),
+        "date": report.get("date"),
+        "org": report.get("org"),
+        "total_datasets": report.get("total_datasets"),
+        "total_episodes": report.get("total_episodes"),
+        "total_frames": report.get("total_frames"),
+        "total_hours": report.get("total_hours"),
+        "datasets": [{k: d.get(k) for k in _HISTORY_DS_FIELDS}
+                     for d in report.get("datasets", [])],
+    }
+
+
+def append_history(report, path=CONFIG_FILE):
+    """Fold a trimmed snapshot of `report` into config["pull_history"].
+
+    Re-reads the file first so the hand-edited uploader_names (and any other
+    keys) are preserved. Dedupes by pulled_at and keeps history oldest-first.
+    """
+    cfg = load_config(path)
+    hist = cfg.get("pull_history", []) or []
+    snap = _trim_report(report)
+    hist = [h for h in hist if h.get("pulled_at") != snap.get("pulled_at")]
+    hist.append(snap)
+    hist.sort(key=lambda r: r.get("pulled_at") or "")
+    cfg["pull_history"] = hist
+    cfg.setdefault("uploader_names", {})  # keep the section present for editors
+    Path(path).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    return path
+
+
+def load_history(out_dir, config_file=CONFIG_FILE):
+    """Load pull snapshots oldest-first for trends / deltas.
+
+    Merges config["pull_history"] (committed) with any local
+    pulls/*/pull_result_*.json still on disk, deduping by pulled_at so both
+    sources contribute but neither double-counts.
+    """
+    by_at = {}
+    for r in load_config(config_file).get("pull_history", []) or []:
+        by_at[r.get("pulled_at") or id(r)] = r
     for f in sorted(Path(out_dir).glob("*/pull_result_*.json")):
         try:
-            history.append(json.loads(f.read_text()))
+            r = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
+        by_at.setdefault(r.get("pulled_at") or str(f), r)  # config wins on ties
+    history = list(by_at.values())
     history.sort(key=lambda r: r.get("pulled_at", ""))
     return history
 
