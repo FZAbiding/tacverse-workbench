@@ -91,15 +91,46 @@ def build_summary(repo_id: str, local_dir: str) -> dict:
         # Not a LeRobot-style dataset (no meta/info.json); leave the
         # info-derived fields absent rather than guessing.
         print(f"Note: {info_path} not found; summary limited to name and link.")
+    tasks_path = Path(local_dir) / "meta" / "tasks.parquet"
+    if tasks_path.is_file():
+        import tasks_reader
+
+        rows, _ = tasks_reader.load(tasks_path)
+        summary["tasks"] = rows
     return summary
 
 
-def fetch_summary(repo_id: str, token=None) -> dict:
-    """Summarize a dataset by fetching ONLY its meta/info.json (no full download).
+def fetch_tasks(repo_id: str, token=None) -> list:
+    """Fetch a dataset's task instructions from meta/tasks.parquet.
 
-    Used for the stats-only path: downloads a single small file instead of the
-    whole (potentially huge) dataset. Falls back to name+link if info.json is
-    absent.
+    tasks.parquet is a tiny file (a few KB) carrying the natural-language task
+    string(s) the dataset was recorded against — the base "prompt". Fetched on
+    the stats-only path so the dashboard can show prompts without a full pull.
+    Returns [{"index", "task"}] (sorted), or [] if absent/unreadable.
+    """
+    from huggingface_hub import hf_hub_download
+
+    try:
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename="meta/tasks.parquet",
+            repo_type="dataset",
+            token=token,
+        )
+    except Exception:
+        return []  # dataset has no tasks.parquet (or no access)
+    import tasks_reader
+
+    rows, _ = tasks_reader.load(path)
+    return rows
+
+
+def fetch_summary(repo_id: str, token=None) -> dict:
+    """Summarize a dataset by fetching only small meta files (no full download).
+
+    Used for the stats-only path: downloads meta/info.json (+ meta/tasks.parquet
+    for the task prompt) instead of the whole (potentially huge) dataset. Falls
+    back to name+link if info.json is absent.
     """
     from huggingface_hub import hf_hub_download
 
@@ -117,6 +148,7 @@ def fetch_summary(repo_id: str, token=None) -> dict:
     except Exception:
         return summary  # no info.json -> name+link only
     _apply_info(summary, json.loads(Path(info_path).read_text()))
+    summary["tasks"] = fetch_tasks(repo_id, token)
     return summary
 
 

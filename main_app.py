@@ -25,11 +25,16 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFrame, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
-    QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QProgressBar, QPushButton, QSpinBox, QSplitter, QTableWidget,
+    QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
+import annotations_reader as ann
+import tasks_reader as tsk
+import checks as chk_mod
 import download_dataset as dd
 
 OUT_DIR = "pulls"
@@ -39,6 +44,10 @@ RECENT_ORGS = ["TacVerse", "Xense"]  # seeds the editable org combo
 # section — edit that to add people). Ids with no entry render as 未知. Loaded once
 # at startup; edit the file then restart to pick up new names.
 _UPLOADER_NAMES = dd.load_uploader_names()
+
+# Thresholds for the custom quality checks (config.json "checks" section).
+# Loaded once at startup; edit the file then restart to change standards.
+_CHECKS_CFG = dd.load_config().get("checks", {})
 
 
 def uploader_cn(hf_id):
@@ -72,6 +81,7 @@ TABLE_COLS = [
     ("frames", "total_frames", "num"),
     ("小时", "duration_hours", "num"),
     ("均时长(s)", "__avg_sec__", "num"),  # avg seconds/episode — quality signal
+    ("检查", "__check__", "num"),  # custom quality-check badge (✅/⚠️N/❌N)
     ("fps", "fps", "num"),
     ("robot_type", "robot_type", "str"),
     ("任务数", "total_tasks", "num"),
@@ -288,7 +298,15 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TacVerse 多模态物理具身数据集工作台")
-        self.resize(1080, 720)
+        # Sized for a 2560x1440 display, clamped to 94% of the available screen
+        # so it still fits smaller monitors without overflowing.
+        target_w, target_h = 2300, 1360
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            target_w = min(target_w, int(avail.width() * 0.94))
+            target_h = min(target_h, int(avail.height() * 0.94))
+        self.resize(target_w, target_h)
         self.token = resolve_token()
         self.worker = None
         self.report = None
@@ -430,6 +448,9 @@ class MainWindow(QWidget):
         self.filter_edit.setPlaceholderText("按 名称 / robot_type / 上传者 过滤…")
         self.filter_edit.textChanged.connect(self._apply_filter)
         filt.addWidget(self.filter_edit)
+        self.only_issues = QCheckBox("只看有问题的")
+        self.only_issues.toggled.connect(self._apply_filter)
+        filt.addWidget(self.only_issues)
         v.addLayout(filt)
 
         # Table
@@ -440,14 +461,120 @@ class MainWindow(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.verticalHeader().setVisible(False)
         self.table.cellDoubleClicked.connect(self._open_row_link)
+        self.table.itemSelectionChanged.connect(self._on_dataset_selected)
         hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        # Dataset name: wide, user-resizable (Stretch left it too narrow to show
+        # long ids). The last column stretches to absorb any trailing slack.
+        hdr.setSectionResizeMode(0, QHeaderView.Interactive)
         for i in range(1, len(TABLE_COLS)):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-        v.addWidget(self.table, 1)
+        hdr.setStretchLastSection(True)
+        self.table.setColumnWidth(0, 440)
+
+        # Master-detail: table (left) + language-annotation Prompt panel (right).
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(self.table)
+        split.addWidget(self._build_prompt_panel())
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 1)
+        split.setCollapsible(1, True)
+        split.setSizes([1180, 400])
+        v.addWidget(split, 1)
+
         self.table_hint = QLabel("点「统计当前数据集」加载数据集列表(双击行打开 HF 页面)。")
         v.addWidget(self.table_hint)
         return w
+
+    def _build_prompt_panel(self):
+        """Right-side read-only Prompt panel for the selected dataset.
+
+        Two stacked sections, both read straight from the pulled files:
+          1. 任务指令 (task)  — meta/tasks.parquet, native to every dataset.
+          2. 语言标注 (viewer) — meta/lerobot_annotations.json, only if authored.
+        A single centered label covers the "nothing selected / not pulled" case."""
+        panel = QWidget()
+        pv = QVBoxLayout(panel)
+        pv.setContentsMargins(8, 0, 0, 0)
+
+        title = QLabel("📋 ANNOTATIONS 标注")
+        title.setStyleSheet("font-weight: bold;")
+        pv.addWidget(title)
+
+        self.prompt_meta = QLabel("")
+        self.prompt_meta.setStyleSheet("color: #888; font-size: 12px;")
+        self.prompt_meta.setWordWrap(True)
+        pv.addWidget(self.prompt_meta)
+
+        # --- Section 1: native task instructions (meta/tasks.parquet) --------
+        self.task_box = QWidget()
+        tb = QVBoxLayout(self.task_box)
+        tb.setContentsMargins(0, 4, 0, 0)
+        task_hd = QLabel("Language Instruction")
+        task_hd.setStyleSheet("font-weight: bold; color: #555;")
+        tb.addWidget(task_hd)
+        self.task_list = QListWidget()
+        self.task_list.setWordWrap(True)
+        self.task_list.setMaximumHeight(140)
+        tb.addWidget(self.task_list)
+        self.task_note = QLabel("")
+        self.task_note.setStyleSheet("color: #999; font-size: 12px;")
+        self.task_note.setWordWrap(True)
+        tb.addWidget(self.task_note)
+        pv.addWidget(self.task_box)
+
+        # --- Section 2: viewer language annotations -------------------------
+        self.anno_box = QWidget()
+        ab = QVBoxLayout(self.anno_box)
+        ab.setContentsMargins(0, 4, 0, 0)
+        anno_hd = QLabel("语言标注 (viewer)")
+        anno_hd.setStyleSheet("font-weight: bold; color: #555;")
+        ab.addWidget(anno_hd)
+
+        ep_row = QHBoxLayout()
+        ep_row.addWidget(QLabel("集:"))
+        self.prompt_ep = QComboBox()
+        self.prompt_ep.currentIndexChanged.connect(self._refresh_prompt_tree)
+        ep_row.addWidget(self.prompt_ep, 1)
+        self.prompt_ep_wrap = QWidget()
+        self.prompt_ep_wrap.setLayout(ep_row)
+        ab.addWidget(self.prompt_ep_wrap)
+
+        self.prompt_tree = QTreeWidget()
+        self.prompt_tree.setHeaderHidden(True)
+        self.prompt_tree.setWordWrap(True)
+        self.prompt_tree.setRootIsDecorated(True)
+        ab.addWidget(self.prompt_tree, 1)
+
+        self.anno_note = QLabel("")
+        self.anno_note.setStyleSheet("color: #999; font-size: 12px;")
+        self.anno_note.setWordWrap(True)
+        ab.addWidget(self.anno_note)
+        pv.addWidget(self.anno_box, 1)
+
+        # --- Section 3: quality checks (grouped by provider) ----------------
+        self.check_box = QWidget()
+        cb = QVBoxLayout(self.check_box)
+        cb.setContentsMargins(0, 4, 0, 0)
+        check_hd = QLabel("检查")
+        check_hd.setStyleSheet("font-weight: bold; color: #555;")
+        cb.addWidget(check_hd)
+        self.check_tree = QTreeWidget()
+        self.check_tree.setHeaderHidden(True)
+        self.check_tree.setWordWrap(True)
+        self.check_tree.setRootIsDecorated(True)
+        cb.addWidget(self.check_tree, 1)
+        pv.addWidget(self.check_box, 1)
+
+        # --- Fallback: nothing selected -------------------------------------
+        self.prompt_empty = QLabel("选择左侧数据集查看 Prompt。")
+        self.prompt_empty.setStyleSheet("color: #999;")
+        self.prompt_empty.setWordWrap(True)
+        self.prompt_empty.setAlignment(Qt.AlignCenter)
+        pv.addWidget(self.prompt_empty, 1)
+
+        self._prompt_doc = {"episodes": {}, "updated_at": None}
+        self._show_prompt_empty("选择左侧数据集查看 Prompt。")
+        return panel
 
     def _make_card(self, key, title):
         card = QFrame()
@@ -608,6 +735,13 @@ class MainWindow(QWidget):
                     hrs = d.get("duration_hours") or 0
                     v = round(hrs * 3600 / eps, 1) if eps else 0
                     item = NumericItem(fmt_value(v), v)
+                elif key == "__check__":
+                    results, agg = chk_mod.run_checks(d, cfg=_CHECKS_CFG)
+                    txt, sort_key = chk_mod.badge(agg)
+                    item = NumericItem(txt, sort_key)
+                    item.setToolTip("\n".join(
+                        f"{chk_mod.icon(x.status)} {x.title}: {x.message}"
+                        for x in results))
                 elif key == "__uploader_cn__":
                     item = QTableWidgetItem(uploader_cn(d.get("uploader")))
                 elif kind == "num":
@@ -635,12 +769,17 @@ class MainWindow(QWidget):
 
     def _apply_filter(self):
         q = self.filter_edit.text().strip().lower()
+        only_issues = self.only_issues.isChecked()
         for row in range(self.table.rowCount()):
             d = self.table.item(row, 0).data(Qt.UserRole) or {}
             hay = " ".join(str(d.get(k, "")) for k in
                            ("dataset_name", "robot_type", "uploader")).lower()
             hay += " " + uploader_cn(d.get("uploader")).lower()
-            self.table.setRowHidden(row, bool(q) and q not in hay)
+            hide = bool(q) and q not in hay
+            if not hide and only_issues:
+                _, agg = chk_mod.run_checks(d, cfg=_CHECKS_CFG)
+                hide = agg["worst"] == chk_mod.OK
+            self.table.setRowHidden(row, hide)
 
     def _open_row_link(self, row, _col):
         d = self.table.item(row, 0).data(Qt.UserRole) or {}
@@ -648,6 +787,176 @@ class MainWindow(QWidget):
         if link:
             QDesktopServices.openUrl(QUrl(link))
             self.status.setText(f"已打开: {link}")
+
+    # ---- Language-annotation Prompt panel (read-only, 方式1 读文件) ----------
+    def _selected_dataset(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        return item.data(Qt.UserRole) if item else None
+
+    def _show_prompt_empty(self, msg):
+        """Show only the centered fallback label (nothing selected)."""
+        self.prompt_empty.setText(msg)
+        self.prompt_empty.setVisible(True)
+        self.task_box.setVisible(False)
+        self.anno_box.setVisible(False)
+        self.check_box.setVisible(False)
+
+    def _on_dataset_selected(self):
+        d = self._selected_dataset()
+        if not d:
+            self.prompt_meta.setText("")
+            self._show_prompt_empty("选择左侧数据集查看 Prompt / 检查。")
+            return
+
+        name = (d.get("dataset_name") or "").split("/")[-1]
+        # Task text carried inline in the record (fetched during 统计/拉取) is
+        # preferred — it means the prompt shows without any local file.
+        inline_tasks = d.get("tasks") if isinstance(d.get("tasks"), list) else None
+        task_path = tsk.resolve_path(d, OUT_DIR)
+        anno_path = ann.resolve_path(d, OUT_DIR)
+
+        # Checks run off the record itself (name / duration / prompt), so the
+        # panel is useful for any selected row even before a full pull.
+        self.prompt_empty.setVisible(False)
+        self.task_box.setVisible(True)
+        self.anno_box.setVisible(True)
+        self.check_box.setVisible(True)
+
+        n_tasks = self._refresh_tasks(inline_tasks, task_path)
+        n_anno_eps, total_eps = self._refresh_annotations(anno_path)
+        agg = self._refresh_checks(d)
+
+        bits = [f"数据集: {name}", f"{n_tasks} 条指令"]
+        if anno_path:
+            bits.append(f"{n_anno_eps}/{total_eps} 集有标注")
+        if agg["n_fail"] or agg["n_warn"]:
+            bits.append(f"检查 {chk_mod.badge(agg)[0]}")
+        self.prompt_meta.setText(" · ".join(bits))
+
+    def _refresh_checks(self, d):
+        """Populate the 检查 tree (grouped by provider). Returns the aggregate."""
+        self.check_tree.clear()
+        results, agg = chk_mod.run_checks(
+            d, providers=("custom", "viewer"), cfg=_CHECKS_CFG)
+        provider_cn = {"custom": "自定义检查", "viewer": "Viewer 检查"}
+        by_provider = {}
+        for r in results:
+            by_provider.setdefault(r.provider, []).append(r)
+        for provider in ("custom", "viewer"):
+            group = by_provider.get(provider)
+            if not group:
+                continue
+            parent = QTreeWidgetItem([provider_cn.get(provider, provider)])
+            f = parent.font(0)
+            f.setBold(True)
+            parent.setFont(0, f)
+            self.check_tree.addTopLevelItem(parent)
+            for r in group:
+                line = f"{chk_mod.icon(r.status)} {r.title}: {r.message}"
+                node = QTreeWidgetItem([line])
+                node.setToolTip(0, line)
+                parent.addChild(node)
+                for det in r.details:
+                    node.addChild(QTreeWidgetItem([det]))
+                node.setExpanded(True)
+            parent.setExpanded(True)
+        return agg
+
+    def _refresh_tasks(self, inline, path):
+        """Fill the task-instruction list. Prefers inline task rows (from the
+        stats/pull record); falls back to reading a local tasks.parquet.
+        Returns the task count."""
+        self.task_list.clear()
+
+        def note(msg):
+            self.task_list.setVisible(False)
+            self.task_note.setVisible(True)
+            self.task_note.setText(msg)
+
+        if inline:
+            tasks = inline
+        elif path:
+            tasks, err = tsk.load(path)
+            if err:
+                note(err)
+                return 0
+        else:
+            note("无 Language Instruction(该数据集未提供 tasks.parquet)。")
+            return 0
+
+        if not tasks:
+            note("无 Language Instruction(该数据集未提供 tasks.parquet)。")
+            return 0
+
+        for row in tasks:
+            item = QListWidgetItem(f"[{row['index']}] {row['task']}")
+            item.setToolTip(row["task"])
+            self.task_list.addItem(item)
+        self.task_list.setVisible(True)
+        self.task_note.setVisible(False)
+        return len(tasks)
+
+    def _refresh_annotations(self, path):
+        """Fill the viewer-annotation tree. Returns (annotated_eps, total_eps)."""
+        doc, err = ann.load(path) if path else ({"episodes": {}}, None)
+        self._prompt_doc = doc
+        eps = ann.episodes_with_atoms(doc)
+        total_eps = len(doc.get("episodes", {}))
+
+        def note(msg):
+            self.prompt_ep_wrap.setVisible(False)
+            self.prompt_tree.setVisible(False)
+            self.anno_note.setVisible(True)
+            self.anno_note.setText(msg)
+
+        if not path:
+            note("暂无 viewer 语言标注(可在 viewer 中编辑生成)。")
+            return 0, 0
+        if err:
+            note(err)
+            return 0, total_eps
+        if not eps:
+            note("暂无 viewer 语言标注(可在 viewer 中编辑生成)。")
+            return 0, total_eps
+
+        self.prompt_ep.blockSignals(True)
+        self.prompt_ep.clear()
+        for ep in eps:
+            self.prompt_ep.addItem(f"ep {ep}", ep)
+        self.prompt_ep.setCurrentIndex(0)
+        self.prompt_ep.blockSignals(False)
+
+        self.anno_note.setVisible(False)
+        self.prompt_ep_wrap.setVisible(True)
+        self.prompt_tree.setVisible(True)
+        self._refresh_prompt_tree()
+        return len(eps), total_eps
+
+    def _refresh_prompt_tree(self):
+        self.prompt_tree.clear()
+        ep = self.prompt_ep.currentData()
+        if ep is None:
+            return
+        atoms = ann.atoms_for_episode(self._prompt_doc, ep)
+        for style, group in ann.group_by_style(atoms):
+            parent = QTreeWidgetItem([f"{ann.style_label(style)} ({len(group)})"])
+            f = parent.font(0)
+            f.setBold(True)
+            parent.setFont(0, f)
+            self.prompt_tree.addTopLevelItem(parent)
+            for atom in group:
+                text = ann.atom_text(atom)
+                if ann.is_event_style(style):
+                    ts = atom.get("timestamp")
+                    if isinstance(ts, (int, float)):
+                        text = f"{ts:.1f}s  {text}"
+                child = QTreeWidgetItem([text])
+                child.setToolTip(0, text)
+                parent.addChild(child)
+            parent.setExpanded(True)
 
     def _refresh_trends(self):
         series = dd.daily_series(self.history)

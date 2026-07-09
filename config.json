@@ -1,4 +1,38 @@
 {
+  "checks": {
+    "name_format": {
+      "regex": "^TacVerse/taccap-g1-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\\d{4}$"
+    },
+    "avg_duration": {
+      "min_sec": 20,
+      "max_sec": 200
+    },
+    "prompt": {
+      "min_words": 10,
+      "max_words": 30,
+      "illegal_chars": [
+        "_",
+        "-",
+        "，",
+        "。",
+        "、",
+        "；",
+        "：",
+        "？",
+        "！",
+        "（",
+        "）",
+        "“",
+        "”",
+        "‘",
+        "’",
+        "《",
+        "》",
+        "—",
+        "·"
+      ]
+    }
+  },
   "uploader_names": {
     "Vertax": "杨信诚",
     "xensedyl": "董耀琳",
@@ -16,7 +50,8 @@
     "TwentyCat": "Hong",
     "bdjahxs": "任佳林",
     "yhsguejh": "莫凡",
-    "shilin5499": "祝石林"
+    "shilin5499": "祝石林",
+    "yangbaicai147": "杨蔡田雨"
   },
   "pull_history": [
     {
