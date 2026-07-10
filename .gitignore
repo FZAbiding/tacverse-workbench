@@ -18,3 +18,6 @@ __pycache__/
 
 # HF cache (if ever created here)
 .cache/
+
+# Locally-saved HF token from the 切换账号 dialog — never commit / share.
+.hf_token

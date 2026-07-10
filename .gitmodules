@@ -1,0 +1,3 @@
+[submodule "vendor/lerobot_viewer"]
+	path = vendor/lerobot_viewer
+	url = https://github.com/Vertax42/xense_lerobot_viewer.git

@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 import annotations_reader as ann
 import tasks_reader as tsk
 import checks as chk_mod
+import viewer_service as vsvc
 import download_dataset as dd
 
 OUT_DIR = "pulls"
@@ -55,14 +56,44 @@ def uploader_cn(hf_id):
     return _UPLOADER_NAMES.get(hf_id, "未知") if hf_id else "未知"
 
 
+# Local, git-ignored file where the "切换账号" dialog persists its token so it
+# survives restarts without being committed / shared with other users.
+TOKEN_FILE = Path(__file__).resolve().parent / ".hf_token"
+
+
+def load_saved_token():
+    """Return the locally-persisted token (from the 切换账号 dialog), or None."""
+    try:
+        tok = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        return tok or None
+    except OSError:
+        return None
+
+
+def save_token(tok):
+    """Persist `tok` to the git-ignored .hf_token (0600), or clear it if empty."""
+    try:
+        if tok and tok.strip():
+            TOKEN_FILE.write_text(tok.strip() + "\n", encoding="utf-8")
+            os.chmod(TOKEN_FILE, 0o600)
+        elif TOKEN_FILE.exists():
+            TOKEN_FILE.unlink()
+    except OSError:
+        pass
+
+
 def resolve_token():
     """HF token to talk to the Hub with.
 
-    Prefer $HF_TOKEN, but fall back to the token cached by `huggingface-cli
-    login` so a normal login "just works" without exporting anything. Private
-    datasets are only visible when this token belongs to an org member — e.g.
-    log in as a TacVerse member to see TacVerse's private repos.
+    Priority: the token saved by the "切换账号" dialog (so the account you pick
+    in the UI sticks across restarts), then $HF_TOKEN, then the token cached by
+    `huggingface-cli login`. Private datasets are only visible when this token
+    belongs to an org member — e.g. a TacVerse member sees TacVerse's private
+    repos.
     """
+    saved = load_saved_token()
+    if saved:
+        return saved
     tok = os.environ.get("HF_TOKEN")
     if tok:
         return tok
@@ -77,6 +108,7 @@ pg.setConfigOptions(background="w", foreground="k", antialias=True)
 # Dashboard table columns: (header, dataset key, kind). "__delta__" is special.
 TABLE_COLS = [
     ("数据集", "dataset_name", "str"),
+    ("本地", "__local__", "num"),  # raw files downloaded under pulls/ → openable in viewer
     ("episodes", "total_episodes", "num"),
     ("frames", "total_frames", "num"),
     ("小时", "duration_hours", "num"),
@@ -291,6 +323,21 @@ class IdentityWorker(QThread):
         self.done.emit(name, bool(self.token), self.org, count)
 
 
+class ReportWorker(QThread):
+    """Fetch the viewer's /report analysis off the UI thread (it can take tens
+    of seconds). `seq` lets the UI ignore results from stale selections."""
+
+    done = Signal(int, str, object, str)  # seq, rel_path, report|None, error
+
+    def __init__(self, viewer, rel_path, seq):
+        super().__init__()
+        self.viewer, self.rel_path, self.seq = viewer, rel_path, seq
+
+    def run(self):
+        report, err = self.viewer.report(self.rel_path, timeout=180)
+        self.done.emit(self.seq, self.rel_path, report, err or "")
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
@@ -298,23 +345,42 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TacVerse 多模态物理具身数据集工作台")
-        # Sized for a 2560x1440 display, clamped to 94% of the available screen
-        # so it still fits smaller monitors without overflowing.
-        target_w, target_h = 2300, 1360
+        # Large default for a 2560x1440 display, but kept clearly below the work
+        # area (~82% w / ~85% h) and centred: opening too close to full-screen
+        # makes some window managers auto-maximize the window a moment after it
+        # maps. Start in the normal (non-maximized) state explicitly.
+        target_w, target_h = 2200, 1300
         screen = QApplication.primaryScreen()
         if screen:
             avail = screen.availableGeometry()
-            target_w = min(target_w, int(avail.width() * 0.94))
-            target_h = min(target_h, int(avail.height() * 0.94))
+            target_w = min(target_w, int(avail.width() * 0.82))
+            target_h = min(target_h, int(avail.height() * 0.85))
+        self.setWindowState(Qt.WindowNoState)
         self.resize(target_w, target_h)
+        if screen:
+            frame = self.frameGeometry()
+            frame.moveCenter(avail.center())
+            self.move(frame.topLeft())
         self.token = resolve_token()
         self.worker = None
         self.report = None
         self.history = []
         self._id_workers = []  # in-flight IdentityWorkers (kept alive until done)
         self._id_seq = 0       # monotonic id; only the latest check may update UI
+        # Vendored viewer (xense_lerobot_viewer) managed as a black-box service.
+        # Port 3001 keeps it separate from any viewer the user runs on 3000, so
+        # workbench always launches its own instance bound to the pulls root.
+        self.viewer = vsvc.ViewerService(port=3001)
+        self._report_workers = []   # in-flight ReportWorkers
+        self._report_seq = 0        # only the latest selection's report renders
+        self._report_cache = {}     # rel_path -> report dict (per session)
 
         self._build_ui()
+
+        # Auto-start the viewer so the analysis panel works without a manual
+        # step. Non-blocking; the Viewer tab's status shows progress.
+        if self.viewer.available():
+            self.viewer.start(self._viewer_root(), wait=False)
 
         self._watch_dir = None
         self._prev_bytes = 0
@@ -379,6 +445,26 @@ class MainWindow(QWidget):
         for b in (self.btn_check, self.btn_open):
             b.setStyleSheet(secondary_css)
             top.addWidget(b)
+
+        # Viewer service controls, up here in the toolbar (the "Viewer" tab is
+        # kept for now but may be removed later — these are the canonical ones).
+        vdiv = QFrame()
+        vdiv.setFrameShape(QFrame.VLine)
+        vdiv.setFrameShadow(QFrame.Sunken)
+        top.addWidget(vdiv)
+        self.top_viewer_dot = QLabel("● Viewer")
+        self.top_viewer_dot.setToolTip("Viewer 服务状态")
+        top.addWidget(self.top_viewer_dot)
+        self.top_viewer_start = QPushButton("启动")
+        self.top_viewer_stop = QPushButton("停止")
+        self.top_viewer_home = QPushButton("首页")
+        self.top_viewer_start.clicked.connect(self._viewer_start)
+        self.top_viewer_stop.clicked.connect(self._viewer_stop)
+        self.top_viewer_home.clicked.connect(self._viewer_open_home)
+        for b in (self.top_viewer_start, self.top_viewer_stop, self.top_viewer_home):
+            b.setStyleSheet(secondary_css)
+            top.addWidget(b)
+
         top.addSpacing(16)
         top.addWidget(QLabel("每日目标(小时):"))
         self.target_spin = QSpinBox()
@@ -403,6 +489,7 @@ class MainWindow(QWidget):
         self.tabs.addTab(self._build_dashboard_tab(), "看板")
         self.tabs.addTab(self._build_trends_tab(), "趋势")
         self.tabs.addTab(self._build_rollup_tab(), "分组统计")
+        self.tabs.addTab(self._build_viewer_tab(), "Viewer")
         root.addWidget(self.tabs, 1)
 
         # Progress: status line + (bar + speed)
@@ -496,9 +583,16 @@ class MainWindow(QWidget):
         pv = QVBoxLayout(panel)
         pv.setContentsMargins(8, 0, 0, 0)
 
+        title_row = QHBoxLayout()
         title = QLabel("📋 ANNOTATIONS 标注")
         title.setStyleSheet("font-weight: bold;")
-        pv.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch()
+        self.open_viewer_btn = QPushButton("🔍 在 Viewer 打开")
+        self.open_viewer_btn.setToolTip("在浏览器的 Viewer 里打开选中的数据集（需先启动 Viewer）")
+        self.open_viewer_btn.clicked.connect(self._open_selected_in_viewer)
+        title_row.addWidget(self.open_viewer_btn)
+        pv.addLayout(title_row)
 
         self.prompt_meta = QLabel("")
         self.prompt_meta.setStyleSheet("color: #888; font-size: 12px;")
@@ -521,6 +615,33 @@ class MainWindow(QWidget):
         self.task_note.setWordWrap(True)
         tb.addWidget(self.task_note)
         pv.addWidget(self.task_box)
+
+        # --- Section 1.5: viewer /report analysis (key info without WebUI) ---
+        self.report_box = QWidget()
+        rb = QVBoxLayout(self.report_box)
+        rb.setContentsMargins(0, 4, 0, 0)
+        report_hd = QLabel("Viewer 分析 (report)")
+        report_hd.setStyleSheet("font-weight: bold; color: #555;")
+        rb.addWidget(report_hd)
+        # Indeterminate marquee shown while the background analysis runs, so it
+        # reads as "working" rather than "frozen".
+        self.report_progress = QProgressBar()
+        self.report_progress.setRange(0, 0)  # 0..0 = animated indeterminate
+        self.report_progress.setTextVisible(False)
+        self.report_progress.setMaximumHeight(6)
+        self.report_progress.setVisible(False)
+        rb.addWidget(self.report_progress)
+        self.report_tree = QTreeWidget()
+        self.report_tree.setHeaderHidden(True)
+        self.report_tree.setWordWrap(True)
+        self.report_tree.setRootIsDecorated(False)
+        self.report_tree.setMaximumHeight(240)
+        rb.addWidget(self.report_tree)
+        self.report_note = QLabel("")
+        self.report_note.setStyleSheet("color: #999; font-size: 12px;")
+        self.report_note.setWordWrap(True)
+        rb.addWidget(self.report_note)
+        pv.addWidget(self.report_box)
 
         # --- Section 2: viewer language annotations -------------------------
         self.anno_box = QWidget()
@@ -646,6 +767,141 @@ class MainWindow(QWidget):
         v.addWidget(self.rollup_plot)
         return w
 
+    # ---- Viewer tab (vendored xense_lerobot_viewer, black-box service) ---- #
+    def _viewer_root(self):
+        """The dataset root the viewer scans (contract ①): the latest pull-date
+        folder under pulls/ (so it shows the most recent pull, without the
+        per-date duplicates you'd get by pointing at pulls/ itself). Falls back
+        to pulls/ when there are no date folders yet."""
+        base = Path(OUT_DIR)
+        dates = sorted((p for p in base.glob("*")
+                        if p.is_dir() and p.name.isdigit()),
+                       key=lambda p: p.name)
+        return str((dates[-1] if dates else base).resolve())
+
+    def _build_viewer_tab(self):
+        """Reserved space for the viewer: service status + controls.
+
+        The viewer serves ALL its features over the web; this tab drives its
+        lifecycle and opens it in the browser. The placeholder area is kept so
+        a future phase can drop an embedded web view in without restructuring.
+        """
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        self.viewer_status = QLabel("")
+        self.viewer_status.setStyleSheet("font-size: 15px;")
+        v.addWidget(self.viewer_status)
+        self.viewer_detail = QLabel("")
+        self.viewer_detail.setStyleSheet("color: #888; font-size: 12px;")
+        self.viewer_detail.setWordWrap(True)
+        v.addWidget(self.viewer_detail)
+
+        row = QHBoxLayout()
+        self.viewer_start_btn = QPushButton("启动 Viewer")
+        self.viewer_start_btn.clicked.connect(self._viewer_start)
+        self.viewer_stop_btn = QPushButton("停止")
+        self.viewer_stop_btn.clicked.connect(self._viewer_stop)
+        self.viewer_home_btn = QPushButton("打开首页")
+        self.viewer_home_btn.clicked.connect(self._viewer_open_home)
+        for b in (self.viewer_start_btn, self.viewer_stop_btn, self.viewer_home_btn):
+            row.addWidget(b)
+        row.addStretch()
+        v.addLayout(row)
+
+        self.viewer_placeholder = QLabel(
+            "Viewer 以网页形式提供全部功能（数据集预览 / 健康检查 / 3D 回放 / 标注）。\n"
+            "点「启动 Viewer」后，用「打开首页」，或在「看板」选中数据集点「🔍 在 Viewer 打开」。\n\n"
+            "（此区域为预留：后续可在此内嵌网页视图）")
+        self.viewer_placeholder.setAlignment(Qt.AlignCenter)
+        self.viewer_placeholder.setWordWrap(True)
+        self.viewer_placeholder.setStyleSheet(
+            "color: #aaa; border: 1px dashed #ccc; padding: 24px;")
+        v.addWidget(self.viewer_placeholder, 1)
+
+        self._viewer_tick = 0
+        self._viewer_count = None
+        self.viewer_timer = QTimer(self)
+        self.viewer_timer.timeout.connect(self._refresh_viewer_status)
+        self.viewer_timer.start(2000)
+        self._refresh_viewer_status()
+        return w
+
+    def _viewer_start(self):
+        if not self.viewer.available():
+            msg = f"viewer 未就绪：请在 {self.viewer.viewer_dir} 执行 bun install"
+            self.viewer_detail.setText(msg)
+            self.status.setText(msg)
+            return
+        ok, msg = self.viewer.start(self._viewer_root(), wait=False)
+        self.status.setText(f"Viewer: {msg}")
+        self._viewer_count = None
+        self._refresh_viewer_status()
+
+    def _viewer_stop(self):
+        self.viewer.stop()
+        self._viewer_count = None
+        self.status.setText("Viewer 已停止")
+        self._refresh_viewer_status()
+
+    def _viewer_open_home(self):
+        if not self.viewer.is_running():
+            self.status.setText("Viewer 未启动：请先点「启动 Viewer」")
+            return
+        self.viewer.open_home()
+        self.status.setText(f"已打开首页: {self.viewer.home_url()}")
+
+    def _refresh_viewer_status(self):
+        st = self.viewer.status()
+        if not st["running"]:
+            color, text = "#c62828", "未启动"
+        elif st["ready"]:
+            color, text = "#2e7d32", "运行中"
+        else:
+            color, text = "#F9A825", "启动中…"
+
+        # Refresh the dataset count occasionally (every ~6s) to avoid hammering
+        # the discovery API on every tick.
+        self._viewer_tick += 1
+        if st["ready"] and self._viewer_tick % 3 == 0:
+            self._viewer_count = self.viewer.dataset_count()
+        elif not st["ready"]:
+            self._viewer_count = None
+        extra = f" · 可见数据集 {self._viewer_count}" if self._viewer_count is not None else ""
+
+        # Toolbar controls (canonical).
+        self.top_viewer_dot.setText(
+            f'<span style="color:{color}">●</span> Viewer: {text} · {st["port"]}')
+        self.top_viewer_start.setEnabled(not st["running"])
+        self.top_viewer_stop.setEnabled(st["managed"])
+        self.top_viewer_home.setEnabled(st["ready"])
+
+        # Keep the (soon-to-be-optional) Viewer tab in sync if it still exists.
+        if hasattr(self, "viewer_status"):
+            self.viewer_status.setText(
+                f'<span style="color:{color}">●</span> Viewer: {text} · 端口 {st["port"]}')
+            self.viewer_detail.setText(
+                f'数据根: {st["root"] or self._viewer_root()}{extra}   ({st["url"]})')
+            self.viewer_start_btn.setEnabled(not st["running"])
+            self.viewer_stop_btn.setEnabled(st["managed"])
+            self.viewer_home_btn.setEnabled(st["ready"])
+
+    def _open_selected_in_viewer(self):
+        d = self._selected_dataset()
+        if not d:
+            self.status.setText("请先在左侧选中一个数据集")
+            return
+        if not self.viewer.is_running():
+            self.status.setText("Viewer 未启动：请到「Viewer」页点「启动 Viewer」")
+            return
+        rel = self.viewer.dataset_rel_path(d, root=self._viewer_root())
+        if not rel:
+            self.status.setText(
+                f"该数据集不在数据根下（未拉取到 {OUT_DIR}/），无法在 Viewer 打开")
+            return
+        self.viewer.open_dataset(rel)
+        self.status.setText(f"已在浏览器打开: {self.viewer.dataset_url(rel)}")
+
     # ---- Rendering -------------------------------------------------------- #
     def _refresh_all(self):
         self._refresh_kpis()
@@ -717,19 +973,46 @@ class MainWindow(QWidget):
         self.mvp_sub_lbl.setText(
             f"{round(agg['hours'], 2)} 小时 · {fmt_value(agg['eps'])} episodes")
 
+    def _downloaded_leaves(self):
+        """Leaf names of datasets whose raw files are downloaded under pulls/.
+
+        A dataset counts as downloaded when some pulls/<date>/<leaf>/meta/info.json
+        exists (a full 拉取 writes it; 统计-only never touches pulls/). Only these
+        can be opened in the viewer. Scanned once per table refresh."""
+        return {info.parent.parent.name
+                for info in Path(OUT_DIR).glob("*/*/meta/info.json")}
+
     def _refresh_table(self):
         r = self.report
         datasets = r.get("datasets", []) if r else []
         deltas = self._current_deltas()
+        downloaded = self._downloaded_leaves()  # dataset leaf names present in pulls/
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(datasets))
         for row, d in enumerate(datasets):
             for col, (_, key, kind) in enumerate(TABLE_COLS):
-                if key == "__delta__":
+                if key == "__local__":
+                    leaf = (d.get("dataset_name") or "").split("/")[-1]
+                    dl = leaf in downloaded
+                    item = NumericItem("✅ 已下载" if dl else "—", 1 if dl else 0)
+                    item.setToolTip(
+                        "原始文件已下载到本地 pulls/，可在 Viewer 打开" if dl else
+                        "未下载（仅统计信息）；先「拉取」才能在 Viewer 打开")
+                    if dl:
+                        item.setForeground(QBrush(QColor("#2e7d32")))
+                elif key == "__delta__":
                     dv = deltas.get(d["dataset_name"], {})
                     n = dv.get("d_episodes", 0)
-                    txt = ("🆕 " if dv.get("is_new") else "") + (f"+{n}" if n else "0")
+                    if dv.get("is_new"):
+                        txt, color = f"🆕 +{n}", "#1565C0"   # newly created dataset
+                    elif n > 0:
+                        txt, color = f"⬆ +{n}", "#2e7d32"    # grew vs previous pull day
+                    elif n < 0:
+                        txt, color = f"⬇ {n}", "#c62828"     # shrank vs previous
+                    else:
+                        txt, color = "➖ 0", "#9e9e9e"        # unchanged (持平)
                     item = NumericItem(txt, n)
+                    item.setForeground(QBrush(QColor(color)))
                 elif key == "__avg_sec__":
                     eps = d.get("total_episodes") or 0
                     hrs = d.get("duration_hours") or 0
@@ -801,6 +1084,7 @@ class MainWindow(QWidget):
         self.prompt_empty.setText(msg)
         self.prompt_empty.setVisible(True)
         self.task_box.setVisible(False)
+        self.report_box.setVisible(False)
         self.anno_box.setVisible(False)
         self.check_box.setVisible(False)
 
@@ -822,12 +1106,14 @@ class MainWindow(QWidget):
         # panel is useful for any selected row even before a full pull.
         self.prompt_empty.setVisible(False)
         self.task_box.setVisible(True)
+        self.report_box.setVisible(True)
         self.anno_box.setVisible(True)
         self.check_box.setVisible(True)
 
         n_tasks = self._refresh_tasks(inline_tasks, task_path)
         n_anno_eps, total_eps = self._refresh_annotations(anno_path)
         agg = self._refresh_checks(d)
+        self._refresh_report(d)
 
         bits = [f"数据集: {name}", f"{n_tasks} 条指令"]
         if anno_path:
@@ -864,6 +1150,103 @@ class MainWindow(QWidget):
                 node.setExpanded(True)
             parent.setExpanded(True)
         return agg
+
+    # ---- Viewer /report analysis (async, key info without the WebUI) ------ #
+    def _report_show_note(self, msg, busy=False):
+        self.report_tree.setVisible(False)
+        self.report_tree.clear()
+        self.report_progress.setVisible(busy)  # marquee only while analyzing
+        self.report_note.setVisible(True)
+        self.report_note.setText(msg)
+
+    def _refresh_report(self, d):
+        """Show the viewer's /report analysis for the selected dataset. Fetched
+        in a background thread (it can take tens of seconds); cached per
+        session; stale selections are ignored via a monotonic seq."""
+        self._report_seq += 1
+        seq = self._report_seq
+        if not self.viewer.is_running():
+            self._report_show_note("Viewer 未运行；启动后显示分析（Viewer 页）。")
+            return
+        rel = self.viewer.dataset_rel_path(d, root=self._viewer_root())
+        if not rel:
+            self._report_show_note(
+                "该数据集不在 Viewer 数据根（最新拉取日），暂无分析。")
+            return
+        cached = self._report_cache.get(rel)
+        if cached is not None:
+            self._render_report(cached)
+            return
+        self._report_show_note("分析中…（首次约 10–30s）", busy=True)
+        w = ReportWorker(self.viewer, rel, seq)
+        w.done.connect(self._on_report_done)
+        self._report_workers.append(w)
+        w.start()
+
+    def _on_report_done(self, seq, rel, report, err):
+        self._report_workers = [w for w in self._report_workers if w.isRunning()]
+        if report is not None:
+            self._report_cache[rel] = report
+        if seq != self._report_seq:
+            return  # user moved to another dataset; ignore stale result
+        if report is None:
+            self._report_show_note(f"分析失败: {err}")
+            return
+        self._render_report(report)
+
+    def _render_report(self, r):
+        """Render the key /report fields as flat rows in the analysis tree."""
+        self.report_progress.setVisible(False)
+        self.report_note.setVisible(False)
+        self.report_tree.setVisible(True)
+        self.report_tree.clear()
+
+        def row(text):
+            item = QTreeWidgetItem([text])
+            item.setToolTip(0, text)
+            self.report_tree.addTopLevelItem(item)
+
+        integ = r.get("integrity") or {}
+        issues = integ.get("issues") or []
+        row(f"完整性: {integ.get('status', '?')}"
+            + (f" · {'; '.join(issues)}" if issues else ""))
+        ds = r.get("dataset") or {}
+        row(f"摄像头: {len(ds.get('cameras') or [])} · fps {ds.get('fps')}")
+
+        q = r.get("quality") or {}
+        el = q.get("episodeLength")
+        if el:
+            row(f"时长(s): 最短 {el.get('shortest')} · 最长 {el.get('longest')}"
+                f" · 均 {el.get('mean')}")
+        sm = q.get("smoothness")
+        if sm:
+            c = sm.get("counts") or {}
+            row(f"平滑度: {(sm.get('verdict') or {}).get('label')}"
+                f"  (smooth {c.get('smooth', 0)} / jerky {c.get('jerky', 0)})")
+        if q:
+            row(f"抖动集: {len(q.get('jerkyEpisodes') or [])}"
+                f" · 低运动集: {len(q.get('lowMovementEpisodes') or [])}")
+
+        t = r.get("training") or {}
+        sc = t.get("suggestedChunkLength")
+        if sc:
+            row(f"建议 chunk: {sc.get('steps')} 步 ({round(sc.get('seconds', 0), 2)}s)")
+        elif "training" in r:
+            row("建议 chunk: —")
+        cd = t.get("controlDelay")
+        if cd:
+            row(f"控制延迟: {cd.get('meanSteps')} 步"
+                f" ({round(cd.get('seconds', 0), 3)}s)"
+                f" {'因果✓' if cd.get('causalOk') else '非因果✗'}")
+        sv = t.get("speedVariance")
+        if sv:
+            tail = " · 需速度归一" if sv.get("needsVelocityNorm") else ""
+            row(f"速度方差: {(sv.get('verdict') or {}).get('label')}"
+                f" (cv {round(sv.get('cv', 0), 3)}){tail}")
+
+        meta = r.get("meta") or {}
+        if meta.get("sampledEpisodes") is not None:
+            row(f"（抽样 {meta.get('sampledEpisodes')} 集）")
 
     def _refresh_tasks(self, inline, path):
         """Fill the task-instruction list. Prefers inline task rows (from the
@@ -1064,8 +1447,8 @@ class MainWindow(QWidget):
 
         form.addRow("账号(选填):", acc_edit)
         form.addRow("Token:", tok_wrap)
-        hint = QLabel("Token 仅本次运行有效，不会写入磁盘。需长期生效请用 "
-                      "huggingface-cli login。")
+        hint = QLabel("Token 会保存到本地 .hf_token（已被 git 忽略，不会上传或"
+                      "同步给他人），下次启动自动使用。清除请删除该文件。")
         hint.setStyleSheet("color:#888; font-size:12px;")
         hint.setWordWrap(True)
         form.addRow(hint)
@@ -1082,9 +1465,10 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "提示", "Token 不能为空。")
             return
         self.token = token
+        save_token(token)  # persist locally (gitignored) for next runs
         acc = acc_edit.text().strip()
         self.status.setText(
-            f"已应用新 Token{'（'+acc+'）' if acc else ''}，正在校验身份与可见数量 ...")
+            f"已应用并保存 Token{'（'+acc+'）' if acc else ''}，正在校验身份与可见数量 ...")
         self._refresh_identity()
 
     def _refresh_identity(self, *_):
@@ -1120,9 +1504,16 @@ class MainWindow(QWidget):
         self.identity_label.setStyleSheet(f"color:{color}; font-weight:bold;")
 
     def closeEvent(self, event):
+        # Stop the viewer subprocess we launched so it doesn't outlive the app.
+        try:
+            self.viewer.stop()
+        except Exception:
+            pass
         # Let any in-flight identity checks finish so the QThread isn't destroyed
         # mid-run (Qt would otherwise warn / crash on close during a check).
         for w in list(self._id_workers):
+            w.wait(2000)
+        for w in list(self._report_workers):
             w.wait(2000)
         super().closeEvent(event)
 
