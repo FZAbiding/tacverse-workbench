@@ -422,24 +422,29 @@ def load_history(out_dir, config_file=CONFIG_FILE):
 def daily_series(history):
     """Collapse history to one snapshot per day (the day's last pull).
 
-    Returns a date-sorted list of {date, total_hours, total_episodes,
-    total_frames, total_datasets, cum_hours} for trend charts.
+    `total_hours` is the absolute library total at that snapshot (already
+    cumulative). `new_hours` is the day-over-day increase (this day's total
+    minus the previous pulled day's total); the first day's `new_hours` equals
+    its total. Returns a date-sorted list of {date, total_hours, new_hours,
+    total_episodes, total_frames, total_datasets} for trend charts.
     """
     by_day = {}
     for r in history:  # history is oldest-first, so later pulls overwrite
         by_day[r.get("date", "")] = r
     series = []
-    cum = 0.0
+    prev_total = None
     for date in sorted(k for k in by_day if k):
         r = by_day[date]
-        cum += r.get("total_hours", 0) or 0
+        total = r.get("total_hours", 0) or 0
+        new_hours = total if prev_total is None else round(total - prev_total, 3)
+        prev_total = total
         series.append({
             "date": date,
-            "total_hours": r.get("total_hours", 0) or 0,
+            "total_hours": total,
+            "new_hours": new_hours,
             "total_episodes": r.get("total_episodes", 0) or 0,
             "total_frames": r.get("total_frames", 0) or 0,
             "total_datasets": r.get("total_datasets", 0) or 0,
-            "cum_hours": round(cum, 3),
         })
     return series
 
@@ -471,12 +476,19 @@ def compute_deltas(current_report, history):
     snapshot every dataset is marked is_new with its full totals as the delta.
     """
     prior = find_baseline(current_report, history)
-    prev = {}
-    if prior:
-        prev = {d["dataset_name"]: d for d in prior.get("datasets", [])}
+    prev = {d["dataset_name"]: d for d in (prior.get("datasets", []) if prior else [])}
+    # An aggregate-only baseline (backfilled history that has totals but no
+    # per-dataset detail) can't attribute growth to individual datasets. Report
+    # zero per-dataset deltas there instead of pretending everything is new; the
+    # KPI falls back to the aggregate total difference (see main_app._new_totals).
+    aggregate_only = bool(prior) and not prev
     deltas = {}
     for d in current_report.get("datasets", []):
         name = d["dataset_name"]
+        if aggregate_only:
+            deltas[name] = {"d_episodes": 0, "d_frames": 0, "d_hours": 0,
+                            "is_new": False}
+            continue
         p = prev.get(name)
         deltas[name] = {
             "d_episodes": (d.get("total_episodes") or 0) - (p.get("total_episodes") or 0 if p else 0),
