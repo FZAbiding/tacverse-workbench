@@ -1208,14 +1208,14 @@ class MainWindow(QWidget):
         split = QSplitter(Qt.Vertical)
         split.setChildrenCollapsible(False)
 
-        daily_group_box = QGroupBox("单组单日新增总时长")
+        daily_group_box = QGroupBox("HF 单组单日更新总时长")
         daily_group_v = QVBoxLayout(daily_group_box)
-        self.daily_group_hint = QLabel("按每日最后一次快照对比上一天，随当前分组维度统计新增小时。")
+        self.daily_group_hint = QLabel("按 Hugging Face 最后更新时间分日，随当前分组维度统计更新小时。")
         self.daily_group_hint.setStyleSheet("color:#888; font-size:12px;")
         daily_group_v.addWidget(self.daily_group_hint)
         self.daily_group_table = QTableWidget(0, 5)
         self.daily_group_table.setHorizontalHeaderLabels(
-            ["日期", "分组", "新增小时", "新增episodes", "数据集数"])
+            ["HF更新日期", "分组", "更新小时", "episodes", "数据集数"])
         self.daily_group_table.setSortingEnabled(True)
         self.daily_group_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.daily_group_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2554,10 +2554,10 @@ class MainWindow(QWidget):
         self.daily_group_table.setSortingEnabled(False)
         self.daily_group_table.setRowCount(len(rows))
         if not rows:
-            self.daily_group_hint.setText(f"暂无可归因到「{dim}」的单日新增数据。")
+            self.daily_group_hint.setText(f"暂无可归因到「{dim}」的 Hugging Face 每日更新数据。")
         else:
             self.daily_group_hint.setText(
-                f"按每日最后一次快照对比上一天，统计每个「{dim}」分组的新增小时。")
+                f"按 Hugging Face last_modified 日期，统计每个「{dim}」分组当天更新的数据集总小时。")
         for i, row in enumerate(rows):
             values = [
                 fmt_day(row.get("date")),
@@ -2580,7 +2580,8 @@ class MainWindow(QWidget):
         self.rollup_plot.clear()
         dim = self.dim_combo.currentText()
         key_fn = ROLLUP_DIMS[dim]
-        daily_rows = dd.daily_group_series(self.history, key_fn)
+        datasets = self.report.get("datasets", []) if self.report else []
+        daily_rows = dd.hf_daily_group_series(datasets, key_fn)
         self._refresh_daily_group_table(daily_rows, dim)
         if not self.report:
             return

@@ -551,6 +551,43 @@ def daily_uploader_series(history):
     return daily_group_series(history, lambda d: d.get("uploader") or "")
 
 
+def _hf_update_date(dataset):
+    """YYMMDD from a dataset's Hugging Face last_modified timestamp."""
+    value = dataset.get("last_modified")
+    if not value:
+        return ""
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%y%m%d")
+    except (TypeError, ValueError):
+        return str(value)[:10].replace("-", "")[2:]
+
+
+def hf_daily_group_series(datasets, key_fn):
+    """Group current datasets by Hugging Face update day and dimension.
+
+    Uses each dataset's `last_modified` from the Hub rather than local pull
+    snapshots. Returns {date, group, hours, episodes, datasets} sorted by date
+    oldest-first and hours descending within each date.
+    """
+    groups = {}
+    for dataset in datasets or []:
+        date = _hf_update_date(dataset)
+        if not date:
+            continue
+        key = key_fn(dataset) or "—"
+        group = groups.setdefault(
+            (date, key), {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0})
+        group["hours"] += dataset.get("duration_hours") or 0
+        group["episodes"] += dataset.get("total_episodes") or 0
+        group["datasets"] += 1
+    rows = list(groups.values())
+    for row in rows:
+        row["hours"] = round(row["hours"], 3)
+    rows.sort(key=lambda row: (row["date"], -row["hours"], row["group"]))
+    return rows
+
+
 def find_baseline(current_report, history):
     """Return the snapshot to diff `current_report` against: the last pull of the
     most recent *earlier day*.
