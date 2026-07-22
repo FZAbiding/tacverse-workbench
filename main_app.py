@@ -6,7 +6,7 @@ Wraps the logic in download_dataset.py. Top bar (org combo + actions + progress
 
   * 看板   -> KPI cards (+ today's MVP) + filterable, sortable dataset table.
   * 趋势   -> daily new-hours bar + cumulative-hours line (pyqtgraph).
-  * 分组统计 -> rollup by uploader / task / robot_type, table + horizontal bars.
+  * 分组统计 -> rollup by uploader / task / robot_type, plus daily group growth.
   * 数据集编辑 -> 左侧同看板的数据集详情表；右侧两组操作：① 改名 / 改 prompt
     (本地 pyarrow，data+videos 硬链接生成新副本，可推 Hub)；② 删除/拆分/合并/
     增删特征 (子进程调用 lerobot 官方 dataset_tools，见 lerobot_ops_runner.py)。
@@ -165,7 +165,7 @@ DATE_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "last_modifi
 # Order = dropdown order; first entry (上传者) is the default. robot_type last.
 ROLLUP_DIMS = {
     "上传者": lambda d: uploader_cn(d.get("uploader")),
-    "任务": lambda d: dd.task_prefix(d["dataset_name"]),
+    "任务": lambda d: dd.task_prefix(d.get("dataset_name", "")),
     "robot_type": lambda d: d.get("robot_type"),
 }
 
@@ -982,48 +982,16 @@ class MainWindow(QWidget):
         v = QVBoxLayout(w)
         self.trend_hint = QLabel("")
         v.addWidget(self.trend_hint)
-
-        split = QSplitter(Qt.Vertical)
-
-        charts = QWidget()
-        charts_v = QVBoxLayout(charts)
-        charts_v.setContentsMargins(0, 0, 0, 0)
         self.daily_plot = pg.PlotWidget(title="每日新增小时数")
         self.daily_plot.showGrid(x=False, y=True, alpha=0.3)
-        charts_v.addWidget(self.daily_plot)
+        v.addWidget(self.daily_plot)
         self.cum_plot = pg.PlotWidget(title="累计小时数")
         self.cum_plot.showGrid(x=False, y=True, alpha=0.3)
-        charts_v.addWidget(self.cum_plot)
+        v.addWidget(self.cum_plot)
         # X labels are two lines ("07-03\n周五"); give the bottom axis enough
         # height so the weekday line isn't clipped.
         for pltw in (self.daily_plot, self.cum_plot):
             pltw.getAxis("bottom").setHeight(46)
-        split.addWidget(charts)
-
-        daily_user_box = QGroupBox("单用户单日新增上传总时长")
-        daily_user_v = QVBoxLayout(daily_user_box)
-        self.daily_user_hint = QLabel("按每日最后一次快照对比上一天，统计每位上传者的新增小时。")
-        self.daily_user_hint.setStyleSheet("color:#888; font-size:12px;")
-        daily_user_v.addWidget(self.daily_user_hint)
-        self.daily_user_table = QTableWidget(0, 6)
-        self.daily_user_table.setHorizontalHeaderLabels(
-            ["日期", "HF ID", "上传者", "新增小时", "新增episodes", "数据集数"])
-        self.daily_user_table.setSortingEnabled(True)
-        self.daily_user_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.daily_user_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.daily_user_table.verticalHeader().setVisible(False)
-        daily_hdr = self.daily_user_table.horizontalHeader()
-        daily_hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        daily_hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        daily_hdr.setSectionResizeMode(2, QHeaderView.Stretch)
-        for col in range(3, 6):
-            daily_hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        daily_user_v.addWidget(self.daily_user_table, 1)
-        split.addWidget(daily_user_box)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
-        split.setSizes([720, 360])
-        v.addWidget(split, 1)
         return w
 
     def _build_rollup_tab(self):
@@ -1038,6 +1006,12 @@ class MainWindow(QWidget):
         row.addStretch()
         v.addLayout(row)
 
+        split = QSplitter(Qt.Vertical)
+
+        summary = QWidget()
+        summary_v = QVBoxLayout(summary)
+        summary_v.setContentsMargins(0, 0, 0, 0)
+
         self.rollup_table = QTableWidget(0, 5)
         self.rollup_table.setHorizontalHeaderLabels(
             ["分组", "数据集数", "episodes", "小时", "占比%"])
@@ -1045,10 +1019,35 @@ class MainWindow(QWidget):
         self.rollup_table.verticalHeader().setVisible(False)
         self.rollup_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.Stretch)
-        v.addWidget(self.rollup_table)
+        summary_v.addWidget(self.rollup_table)
         self.rollup_plot = pg.PlotWidget(title="各分组小时数")
         self.rollup_plot.showGrid(x=False, y=True, alpha=0.3)
-        v.addWidget(self.rollup_plot)
+        summary_v.addWidget(self.rollup_plot)
+        split.addWidget(summary)
+
+        daily_group_box = QGroupBox("单组单日新增总时长")
+        daily_group_v = QVBoxLayout(daily_group_box)
+        self.daily_group_hint = QLabel("按每日最后一次快照对比上一天，随当前分组维度统计新增小时。")
+        self.daily_group_hint.setStyleSheet("color:#888; font-size:12px;")
+        daily_group_v.addWidget(self.daily_group_hint)
+        self.daily_group_table = QTableWidget(0, 5)
+        self.daily_group_table.setHorizontalHeaderLabels(
+            ["日期", "分组", "新增小时", "新增episodes", "数据集数"])
+        self.daily_group_table.setSortingEnabled(True)
+        self.daily_group_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.daily_group_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.daily_group_table.verticalHeader().setVisible(False)
+        daily_hdr = self.daily_group_table.horizontalHeader()
+        daily_hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        daily_hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        for col in range(2, 5):
+            daily_hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        daily_group_v.addWidget(self.daily_group_table, 1)
+        split.addWidget(daily_group_box)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([760, 360])
+        v.addWidget(split, 1)
         return w
 
     # ---- 数据集编辑 tab (edit prompt / rename → new copy, optional push) ---- #
@@ -2318,8 +2317,6 @@ class MainWindow(QWidget):
 
     def _refresh_trends(self):
         series = dd.daily_series(self.history)
-        user_rows = dd.daily_uploader_series(self.history)
-        self._refresh_daily_user_table(user_rows)
         self.daily_plot.clear()
         self.cum_plot.clear()
         if not series:
@@ -2344,39 +2341,41 @@ class MainWindow(QWidget):
         self.cum_plot.getAxis("bottom").setTicks(ticks)
         self.cum_plot.setXRange(-0.5, len(series) - 0.5, padding=0.02)
 
-    def _refresh_daily_user_table(self, rows):
-        self.daily_user_table.setSortingEnabled(False)
-        self.daily_user_table.setRowCount(len(rows))
+    def _refresh_daily_group_table(self, rows, dim):
+        self.daily_group_table.setSortingEnabled(False)
+        self.daily_group_table.setRowCount(len(rows))
         if not rows:
-            self.daily_user_hint.setText("暂无可归因到上传者的单日新增数据。")
+            self.daily_group_hint.setText(f"暂无可归因到「{dim}」的单日新增数据。")
         else:
-            self.daily_user_hint.setText(
-                "按每日最后一次快照对比上一天，统计每位上传者的新增小时。")
+            self.daily_group_hint.setText(
+                f"按每日最后一次快照对比上一天，统计每个「{dim}」分组的新增小时。")
         for i, row in enumerate(rows):
             values = [
                 fmt_day(row.get("date")),
-                row.get("uploader") or "—",
-                uploader_cn(row.get("uploader")),
                 row.get("hours", 0),
                 row.get("episodes", 0),
                 row.get("datasets", 0),
             ]
+            values.insert(1, row.get("group") or "—")
             for j, value in enumerate(values):
-                if j >= 3:
+                if j >= 2:
                     item = NumericItem(fmt_value(value), value)
                 else:
                     item = QTableWidgetItem(str(value))
-                self.daily_user_table.setItem(i, j, item)
-        self.daily_user_table.setSortingEnabled(True)
-        self.daily_user_table.sortItems(0, Qt.DescendingOrder)
+                self.daily_group_table.setItem(i, j, item)
+        self.daily_group_table.setSortingEnabled(True)
+        self.daily_group_table.sortItems(0, Qt.DescendingOrder)
 
     def _refresh_rollup(self):
         self.rollup_table.setRowCount(0)
         self.rollup_plot.clear()
+        dim = self.dim_combo.currentText()
+        key_fn = ROLLUP_DIMS[dim]
+        daily_rows = dd.daily_group_series(self.history, key_fn)
+        self._refresh_daily_group_table(daily_rows, dim)
         if not self.report:
             return
-        dim = self.dim_combo.currentText()
-        rows = dd.rollup(self.report.get("datasets", []), ROLLUP_DIMS[dim])
+        rows = dd.rollup(self.report.get("datasets", []), key_fn)
         self.rollup_table.setRowCount(len(rows))
         for i, g in enumerate(rows):
             vals = [g["group"], g["count"], g["episodes"], g["hours"], g["pct_hours"]]

@@ -462,14 +462,14 @@ def daily_series(history):
     return series
 
 
-def daily_uploader_series(history):
-    """Per-uploader daily positive growth from the last snapshot of each day.
+def daily_group_series(history, key_fn):
+    """Per-group daily positive growth from the last snapshot of each day.
 
     Returns rows sorted by date oldest-first and hours descending within each day:
-    {date, uploader, hours, episodes, datasets}. The first detailed day counts
+    {date, group, hours, episodes, datasets}. The first detailed day counts
     each dataset's full duration as that day's contribution. If the previous day
     has only aggregate totals and no dataset details, attribution for the next
-    day is skipped because per-user growth cannot be derived safely.
+    day is skipped because per-group growth cannot be derived safely.
     """
     by_day = {}
     for r in history:
@@ -496,10 +496,10 @@ def daily_uploader_series(history):
                 episodes = max(0, d_episodes)
                 if hours <= 0 and episodes <= 0:
                     continue
-                uploader = dataset.get("uploader") or ""
+                key = key_fn(dataset) or "—"
                 group = groups.setdefault(
-                    uploader, {"date": date, "uploader": uploader, "hours": 0.0,
-                               "episodes": 0, "datasets": 0})
+                    key, {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0})
                 group["hours"] += hours
                 group["episodes"] += episodes
                 group["datasets"] += 1
@@ -510,6 +510,11 @@ def daily_uploader_series(history):
         prev_report = report
         prev = {d.get("dataset_name"): d for d in datasets if d.get("dataset_name")}
     return rows
+
+
+def daily_uploader_series(history):
+    """Backward-compatible per-uploader daily growth helper."""
+    return daily_group_series(history, lambda d: d.get("uploader") or "")
 
 
 def find_baseline(current_report, history):
