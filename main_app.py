@@ -1113,23 +1113,7 @@ class MainWindow(QWidget):
         v.addLayout(row)
 
         split = QSplitter(Qt.Vertical)
-
-        summary = QWidget()
-        summary_v = QVBoxLayout(summary)
-        summary_v.setContentsMargins(0, 0, 0, 0)
-
-        self.rollup_table = QTableWidget(0, 5)
-        self.rollup_table.setHorizontalHeaderLabels(
-            ["分组", "数据集数", "episodes", "小时", "占比%"])
-        self.rollup_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.rollup_table.verticalHeader().setVisible(False)
-        self.rollup_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Stretch)
-        summary_v.addWidget(self.rollup_table)
-        self.rollup_plot = pg.PlotWidget(title="各分组小时数")
-        self.rollup_plot.showGrid(x=False, y=True, alpha=0.3)
-        summary_v.addWidget(self.rollup_plot)
-        split.addWidget(summary)
+        split.setChildrenCollapsible(False)
 
         daily_group_box = QGroupBox("单组单日新增总时长")
         daily_group_v = QVBoxLayout(daily_group_box)
@@ -1150,9 +1134,26 @@ class MainWindow(QWidget):
             daily_hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         daily_group_v.addWidget(self.daily_group_table, 1)
         split.addWidget(daily_group_box)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
-        split.setSizes([760, 360])
+
+        summary = QWidget()
+        summary_v = QVBoxLayout(summary)
+        summary_v.setContentsMargins(0, 0, 0, 0)
+
+        self.rollup_table = QTableWidget(0, 5)
+        self.rollup_table.setHorizontalHeaderLabels(
+            ["分组", "数据集数", "episodes", "小时", "占比%"])
+        self.rollup_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.rollup_table.verticalHeader().setVisible(False)
+        self.rollup_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.Stretch)
+        summary_v.addWidget(self.rollup_table)
+        self.rollup_plot = pg.PlotWidget(title="各分组小时数")
+        self.rollup_plot.showGrid(x=False, y=True, alpha=0.3)
+        summary_v.addWidget(self.rollup_plot)
+        split.addWidget(summary)
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+        split.setSizes([360, 760])
         v.addWidget(split, 1)
         return w
 
