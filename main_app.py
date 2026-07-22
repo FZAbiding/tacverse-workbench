@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSpinBox, QStackedWidget,
+    QSizePolicy, QSpinBox, QStackedWidget,
     QSplitter, QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -633,8 +633,27 @@ class MainWindow(QWidget):
         root = QVBoxLayout(self)
 
         toolbar = QWidget()
-        top = QHBoxLayout(toolbar)
-        top.setContentsMargins(0, 0, 0, 0)
+        toolbar_v = QVBoxLayout(toolbar)
+        toolbar_v.setContentsMargins(0, 0, 0, 0)
+        toolbar_v.setSpacing(4)
+        top = QHBoxLayout()
+        aux = QHBoxLayout()
+        for row in (top, aux):
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+        toolbar_v.addLayout(top)
+        toolbar_v.addLayout(aux)
+
+        def fit_button(button, min_width=0):
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            button.setMinimumWidth(max(min_width, button.sizeHint().width() + 12))
+
+        def vline():
+            line = QFrame()
+            line.setFrameShape(QFrame.VLine)
+            line.setFrameShadow(QFrame.Sunken)
+            return line
+
         if LOGO_PATH.is_file():
             logo = QLabel()
             logo.setPixmap(QPixmap(str(LOGO_PATH)).scaledToHeight(
@@ -647,6 +666,7 @@ class MainWindow(QWidget):
         self.org_combo.setEditable(True)
         self.org_combo.addItems(RECENT_ORGS)
         self.org_combo.setMinimumWidth(160)
+        self.org_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.org_combo.currentIndexChanged.connect(self._refresh_identity)
         self.org_combo.lineEdit().editingFinished.connect(self._refresh_identity)
         top.addWidget(self.org_combo)
@@ -682,24 +702,31 @@ class MainWindow(QWidget):
         )
         for b in (self.btn_stats, self.btn_download, self.btn_pull):
             b.setMinimumHeight(42)
+            fit_button(b)
             top.addWidget(b)
-        divider = QFrame()
-        divider.setFrameShape(QFrame.VLine)
-        divider.setFrameShadow(QFrame.Sunken)
-        top.addWidget(divider)
+        top.addWidget(vline())
         for b in (self.btn_check, self.btn_open):
             b.setStyleSheet(secondary_css)
+            fit_button(b)
             top.addWidget(b)
+
+        top.addSpacing(12)
+        top.addWidget(QLabel("每日目标(小时):"))
+        self.target_spin = QSpinBox()
+        self.target_spin.setRange(0, 100000)
+        self.target_spin.setValue(10)
+        self.target_spin.setMinimumWidth(76)
+        self.target_spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.target_spin.valueChanged.connect(self._refresh_kpis)
+        top.addWidget(self.target_spin)
+        top.addStretch()
 
         # Viewer service controls, up here in the toolbar (the "Viewer" tab is
         # kept for now but may be removed later — these are the canonical ones).
-        vdiv = QFrame()
-        vdiv.setFrameShape(QFrame.VLine)
-        vdiv.setFrameShadow(QFrame.Sunken)
-        top.addWidget(vdiv)
+        aux.addWidget(vline())
         self.top_viewer_dot = QLabel("● Viewer")
         self.top_viewer_dot.setToolTip("Viewer 服务状态")
-        top.addWidget(self.top_viewer_dot)
+        aux.addWidget(self.top_viewer_dot)
         self.top_viewer_start = QPushButton("启动")
         self.top_viewer_stop = QPushButton("停止")
         self.top_viewer_home = QPushButton("首页")
@@ -712,35 +739,29 @@ class MainWindow(QWidget):
         for b in (self.top_viewer_start, self.top_viewer_stop,
                   self.top_viewer_home, self.open_viewer_btn):
             b.setStyleSheet(secondary_css)
-            top.addWidget(b)
+            fit_button(b)
+            aux.addWidget(b)
 
-        top.addSpacing(16)
-        top.addWidget(QLabel("每日目标(小时):"))
-        self.target_spin = QSpinBox()
-        self.target_spin.setRange(0, 100000)
-        self.target_spin.setValue(10)
-        self.target_spin.valueChanged.connect(self._refresh_kpis)
-        top.addWidget(self.target_spin)
-        top.addStretch()
+        aux.addStretch()
         self.btn_account = QPushButton("切换账号")
         self.btn_account.setStyleSheet(secondary_css)
         self.btn_account.clicked.connect(self.on_switch_account)
-        top.addWidget(self.btn_account)
+        fit_button(self.btn_account)
+        aux.addWidget(self.btn_account)
         # Login / visibility indicator — surfaces token & org-permission problems
         # (e.g. "未登录(匿名) · TacVerse 可见 11 个") without any digging.
         self.identity_label = QLabel("登录状态: 检测中…")
         self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.identity_label.setStyleSheet("color:#888;")
-        top.addWidget(self.identity_label)
+        self.identity_label.setMinimumWidth(220)
+        aux.addWidget(self.identity_label)
 
         # Live clock, far right.
-        sep = QFrame()
-        sep.setFrameShape(QFrame.VLine)
-        sep.setFrameShadow(QFrame.Sunken)
-        top.addWidget(sep)
+        aux.addWidget(vline())
         self.clock_label = QLabel("")
         self.clock_label.setStyleSheet("color:#444; font-weight:bold;")
-        top.addWidget(self.clock_label)
+        self.clock_label.setMinimumWidth(160)
+        aux.addWidget(self.clock_label)
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self._tick_clock)
         self.clock_timer.start(1000)
@@ -749,7 +770,7 @@ class MainWindow(QWidget):
         toolbar_scroll.setFrameShape(QFrame.NoFrame)
         toolbar_scroll.setWidgetResizable(False)
         toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         toolbar_scroll.setMaximumHeight(toolbar.sizeHint().height() + 18)
         toolbar_scroll.setWidget(toolbar)
         root.addWidget(toolbar_scroll)
