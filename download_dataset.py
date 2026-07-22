@@ -160,10 +160,11 @@ def discover_datasets_meta(org, token):
     """
     from huggingface_hub import list_datasets
 
-    # Ask the Hub for its own "Recently updated" ranking (sort by lastModified,
-    # newest first) so our order matches the org page exactly. The client-side
-    # sort below is a stable fallback that also pins timestamp-less repos last.
-    ds = list(list_datasets(author=org, token=token, sort="lastModified", direction=-1))
+    # Ask the Hub for its own "Recently updated" ranking when available; older
+    # huggingface_hub versions (e.g. 1.23.x) do not expose a `direction` kwarg,
+    # so we sort client-side as the source of truth and also pin timestamp-less
+    # repos last.
+    ds = list(list_datasets(author=org, token=token, sort="lastModified"))
     ds.sort(key=lambda d: (d.last_modified is not None, d.last_modified), reverse=True)
     out = []
     for d in ds:

@@ -25,6 +25,26 @@ import sys
 import time
 from pathlib import Path
 
+
+def _configure_qt_plugin_path():
+    """Prefer the PySide6 plugin directory over conda's qt6-main plugins."""
+    plugin_root = (
+        Path(sys.prefix)
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+        / "PySide6"
+        / "Qt"
+        / "plugins"
+    )
+    platform_root = plugin_root / "platforms"
+    if platform_root.is_dir():
+        os.environ["QT_PLUGIN_PATH"] = str(plugin_root)
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platform_root)
+
+
+_configure_qt_plugin_path()
+
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, Signal, QUrl
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPixmap
@@ -36,6 +56,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
+
 
 import annotations_reader as ann
 import tasks_reader as tsk
@@ -2269,12 +2290,12 @@ class MainWindow(QWidget):
         x = list(range(len(series)))
         labels = [fmt_day_wd(s["date"]) for s in series]  # MM-DD + 周X
         ticks = [list(zip(x, labels))]
-        bg = pg.BarGraphItem(x=x, height=[s["new_hours"] for s in series],
+        bg = pg.BarGraphItem(x=x, height=[s.get("new_hours", 0) for s in series],
                              width=0.8, brush="#4C8BF5")
         self.daily_plot.addItem(bg)
         self.daily_plot.getAxis("bottom").setTicks(ticks)
         self.daily_plot.setXRange(-0.5, len(series) - 0.5, padding=0)
-        self.cum_plot.plot(x, [s["total_hours"] for s in series],
+        self.cum_plot.plot(x, [s.get("total_hours", 0) for s in series],
                            pen=pg.mkPen("#34A853", width=2), symbol="o",
                            symbolBrush="#34A853")
         self.cum_plot.getAxis("bottom").setTicks(ticks)
