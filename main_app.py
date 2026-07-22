@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSpinBox, QStackedWidget,
-    QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
+    QSplitter, QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -264,20 +264,20 @@ class FrozenFirstColumnTable(QTableWidget):
     def __init__(self, rows=0, columns=0, parent=None, frozen_width=440):
         super().__init__(rows, columns, parent)
         self._frozen_width = frozen_width
-        self._frozen = QTableWidget(0, 1, self)
+        self._frozen = QTableView(self)
+        self._frozen.setModel(self.model())
+        self._frozen.setSelectionModel(self.selectionModel())
         self._frozen.setFocusPolicy(Qt.NoFocus)
         self._frozen.setFrameShape(QFrame.NoFrame)
         self._frozen.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._frozen.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._frozen.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._frozen.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self._frozen.setHorizontalHeaderLabels([TABLE_COLS[0][0]])
         self._frozen.verticalHeader().hide()
         self._frozen.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self._frozen.horizontalHeader().sectionClicked.connect(self._sort_frozen_column)
-        self._frozen.cellClicked.connect(lambda row, _col: self.selectRow(row))
-        self._frozen.cellDoubleClicked.connect(
-            lambda row, col: self.cellDoubleClicked.emit(row, col))
+        self._frozen.doubleClicked.connect(
+            lambda index: self.cellDoubleClicked.emit(index.row(), index.column()))
         self.horizontalHeader().sectionResized.connect(self._update_frozen_width)
         self.verticalHeader().sectionResized.connect(self._update_frozen_row_height)
         self.verticalScrollBar().valueChanged.connect(
@@ -285,7 +285,6 @@ class FrozenFirstColumnTable(QTableWidget):
         self._frozen.verticalScrollBar().valueChanged.connect(
             self.verticalScrollBar().setValue)
         self._sort_order = Qt.AscendingOrder
-        self.model().layoutChanged.connect(self.refresh_frozen)
 
     def freeze_first_column(self, width=None):
         if width is not None:
@@ -300,14 +299,7 @@ class FrozenFirstColumnTable(QTableWidget):
         self._frozen.show()
 
     def refresh_frozen(self):
-        self._frozen.setRowCount(self.rowCount())
         for row in range(self.rowCount()):
-            src = self.item(row, 0)
-            item = QTableWidgetItem(src.text() if src else "")
-            if src:
-                item.setData(Qt.UserRole, src.data(Qt.UserRole))
-                item.setToolTip(src.toolTip())
-            self._frozen.setItem(row, 0, item)
             self._frozen.setRowHidden(row, self.isRowHidden(row))
             self._frozen.setRowHeight(row, self.rowHeight(row))
         self._frozen.setColumnWidth(0, self._frozen_width)
@@ -316,15 +308,13 @@ class FrozenFirstColumnTable(QTableWidget):
 
     def setRowHidden(self, row, hide):
         super().setRowHidden(row, hide)
-        if row < self._frozen.rowCount():
-            self._frozen.setRowHidden(row, hide)
+        self._frozen.setRowHidden(row, hide)
 
     def _sort_frozen_column(self, column):
         self.sortItems(column, self._sort_order)
         self._sort_order = (Qt.DescendingOrder
                             if self._sort_order == Qt.AscendingOrder
                             else Qt.AscendingOrder)
-        self.refresh_frozen()
 
     def _update_frozen_width(self, column, old_size, new_size):
         if column != 0:
