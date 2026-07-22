@@ -31,6 +31,25 @@
         "—",
         "·"
       ]
+    },
+    "local_quality": {
+      "start_end_window": 10,
+      "boundary_mad_factor": 6.0,
+      "boundary_abs_threshold": 0.2,
+      "jump_mad_factor": 14.0,
+      "jump_abs_threshold": 0.35,
+      "flicker_sample_step": 1,
+      "flicker_luma_threshold": 45.0,
+      "flicker_recover_ratio": 0.45,
+      "max_video_frames": 12000,
+      "clip_margin_sec": 1.0,
+      "clip_lead_sec": 2.0,
+      "clip_max_sec": 8.0,
+      "remote_enabled": true,
+      "remote_cache_dir": ".quality_cache",
+      "report_dir": ".quality_reports",
+      "remote_max_episodes": 0,
+      "max_issues": 80
     }
   },
   "uploader_names": {

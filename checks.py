@@ -41,6 +41,20 @@ DEFAULTS = {
             "（", "）", "“", "”", "‘", "’", "《", "》", "—", "·",
         ],
     },
+    "local_quality": {
+        # Local episode-level checks. They run only for a selected downloaded
+        # dataset, not for every table row.
+        "start_end_window": 10,
+        "boundary_mad_factor": 6.0,
+        "boundary_abs_threshold": 0.20,
+        "jump_mad_factor": 8.0,
+        "jump_abs_threshold": 0.15,
+        "flicker_sample_step": 1,
+        "flicker_luma_threshold": 45.0,
+        "flicker_recover_ratio": 0.45,
+        "max_video_frames": 12000,
+        "max_issues": 80,
+    },
 }
 
 
@@ -151,6 +165,51 @@ def _check_prompt(dataset, cfg):
     status = FAIL if worst >= _SEVERITY[FAIL] else WARN
     details = [line for _, line in all_findings]
     return status, f"{len(all_findings)} 项待改", details
+
+
+@register("episode_local_quality", "Episode 级质量定位", provider="local_quality")
+def _check_local_quality(dataset, cfg):
+    """Locate camera flicker, boundary pose outliers and trajectory jumps.
+
+    The heavy work is delegated to dataset_quality and cached by dataset path.
+    This rule is intentionally under provider="local_quality" so table refreshes
+    stay fast; the GUI invokes it only for the selected dataset detail panel.
+    """
+    import dataset_quality
+
+    issues = dataset_quality.scan_dataset(
+        dataset, out_dir="pulls", cfg=_cfg(cfg, "local_quality"))
+    return format_local_quality_issues(issues)
+
+
+def format_local_quality_issues(issues):
+    """Convert dataset_quality Issue objects to one CheckResult payload."""
+    actionable = [x for x in issues if x.severity in (WARN, FAIL)]
+    skipped = [x for x in issues if x.severity == SKIP]
+    if not actionable:
+        if skipped:
+            return SKIP, skipped[0].message, [x.message for x in skipped[1:]]
+        return OK, "未发现 episode 级异常", []
+
+    worst = max((_SEVERITY.get(x.severity, 0) for x in actionable), default=0)
+    status = FAIL if worst >= _SEVERITY[FAIL] else WARN
+    details = []
+    for x in actionable:
+        parts = []
+        if x.episode_index is not None:
+            parts.append(f"episode {x.episode_index}")
+        if x.start_sec is not None and x.end_sec is not None:
+            parts.append(f"{x.start_sec:.3f}s-{x.end_sec:.3f}s")
+        elif x.frame_index is not None:
+            parts.append(f"frame {x.frame_index}")
+        if x.field:
+            parts.append(x.field)
+        prefix = " / ".join(parts)
+        line = f"{prefix}: {x.message}" if prefix else x.message
+        if x.clip_path:
+            line += f" | video切片: {x.clip_path}"
+        details.append(line)
+    return status, f"{len(actionable)} 项 episode 级问题", details
 
 
 # --- runner + aggregation ---------------------------------------------------

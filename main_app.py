@@ -156,12 +156,14 @@ TABLE_COLS = [
     ("上传者", "__uploader_cn__", "str"),
     ("最后更新", "last_modified", "date"),
     ("今日新增ep", "__delta__", "num"),
+    ("检查状态", "__quality_status__", "str"),
 ]
 
 # Column that carries last_modified — the table's default sort key. Derived so it
 # stays correct if columns are inserted/reordered above.
 DATE_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "last_modified")
 LOCAL_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "__local__")
+QUALITY_STATUS_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "__quality_status__")
 
 # Order = dropdown order; first entry (上传者) is the default. robot_type last.
 ROLLUP_DIMS = {
@@ -261,6 +263,7 @@ class NumericItem(QTableWidgetItem):
 class FrozenDatasetTable(QWidget):
     """Two synchronized tables: fixed dataset column + scrollable detail columns."""
 
+    cellClicked = Signal(int, int)
     cellDoubleClicked = Signal(int, int)
     itemSelectionChanged = Signal()
 
@@ -299,8 +302,8 @@ class FrozenDatasetTable(QWidget):
             self.detail.verticalScrollBar().setValue)
         self.detail.verticalScrollBar().valueChanged.connect(
             self.fixed.verticalScrollBar().setValue)
-        self.fixed.cellClicked.connect(lambda row, _col: self.selectRow(row))
-        self.detail.cellClicked.connect(lambda row, _col: self.selectRow(row))
+        self.fixed.cellClicked.connect(lambda row, col: self._on_cell_clicked(row, col))
+        self.detail.cellClicked.connect(lambda row, col: self._on_cell_clicked(row, col + 1))
         self.fixed.cellDoubleClicked.connect(
             lambda row, col: self.cellDoubleClicked.emit(row, col))
         self.detail.cellDoubleClicked.connect(
@@ -382,6 +385,10 @@ class FrozenDatasetTable(QWidget):
         self.detail.blockSignals(False)
         self.itemSelectionChanged.emit()
 
+    def _on_cell_clicked(self, row, col):
+        self.selectRow(row)
+        self.cellClicked.emit(row, col)
+
     def _sync_selection(self, source):
         row = source.currentRow()
         if row >= 0:
@@ -418,9 +425,9 @@ class FrozenDatasetTable(QWidget):
         clone = item.clone()
         if isinstance(item, NumericItem):
             clone = NumericItem(item.text(), item.sort_key)
-            clone.setData(Qt.UserRole, item.data(Qt.UserRole))
-            clone.setToolTip(item.toolTip())
-            clone.setForeground(item.foreground())
+        clone.setData(Qt.UserRole, item.data(Qt.UserRole))
+        clone.setToolTip(item.toolTip())
+        clone.setForeground(item.foreground())
         return clone
 
 
@@ -541,6 +548,42 @@ class CheckWorker(QThread):
                              len(hub), len(local))
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+class QualityWorker(QThread):
+    """Run local/remote deep episode quality checks off the GUI thread."""
+
+    done = Signal(int, str, list, dict, str)  # seq, dataset_name, results, aggregate, report_dir
+
+    def __init__(self, seq, dataset, token, cfg):
+        super().__init__()
+        self.seq = seq
+        self.dataset = dict(dataset or {})
+        self.dataset_name = self.dataset.get("dataset_name") or ""
+        self.token = token
+        self.cfg = dict(cfg or {})
+
+    def run(self):
+        checks_cfg = dict(self.cfg)
+        local_quality_cfg = dict(checks_cfg.get("local_quality") or {})
+        local_quality_cfg["token"] = self.token
+        checks_cfg["local_quality"] = local_quality_cfg
+        try:
+            import dataset_quality
+            issues, report_dir = dataset_quality.scan_dataset_with_report(
+                self.dataset, out_dir=OUT_DIR, cfg=local_quality_cfg)
+            status, message, details = chk_mod.format_local_quality_issues(issues)
+            results = [chk_mod.CheckResult(
+                "episode_local_quality", "Episode 级质量定位",
+                "local_quality", status, message, details)]
+            agg = chk_mod.aggregate(results)
+        except Exception as exc:
+            report_dir = ""
+            results = [chk_mod.CheckResult(
+                "episode_local_quality", "Episode 级质量定位",
+                "local_quality", chk_mod.SKIP, f"检查出错: {exc}", [])]
+            agg = chk_mod.aggregate(results)
+        self.done.emit(self.seq, self.dataset_name, results, agg, report_dir)
 
 
 class IdentityWorker(QThread):
@@ -693,6 +736,13 @@ class MainWindow(QWidget):
         self._report_workers = []   # in-flight ReportWorkers
         self._report_seq = 0        # only the latest selection's report renders
         self._report_cache = {}     # rel_path -> report dict (per session)
+        self._quality_records = self._load_quality_records()
+        self._quality_status = {
+            k: v.get("status", "已检查") for k, v in self._quality_records.items()
+        }
+        self._quality_reports = {
+            k: v.get("report_dir", "") for k, v in self._quality_records.items()
+        }
         # 数据集编辑 state: the dataset being edited, its prompt editors, and the
         # last copy written (so 推送到 Hub knows what to upload). Workers held on
         # self so they are not GC'd mid-run.
@@ -717,6 +767,10 @@ class MainWindow(QWidget):
         self.speed_timer = QTimer(self)
         self.speed_timer.setInterval(1000)
         self.speed_timer.timeout.connect(self._tick_speed)
+        self.quality_status_timer = QTimer(self)
+        self.quality_status_timer.setInterval(3000)
+        self.quality_status_timer.timeout.connect(self._sync_quality_status_from_disk)
+        self.quality_status_timer.start()
 
         # Render the newest local report immediately so 看板 reflects the last
         # local pull/stat run without requiring network access on startup.
@@ -737,6 +791,48 @@ class MainWindow(QWidget):
             self.status.setText(
                 "就绪：未发现本地拉取数据；可先点「仅拉取统计信息」或「拉取组织及其下所有数据集」。")
         self._refresh_identity()  # populate the login/visibility indicator
+
+    def _load_quality_records(self):
+        try:
+            import dataset_quality
+            cfg = (_CHECKS_CFG.get("local_quality") or {})
+            records = dataset_quality.load_quality_status(
+                path="quality_status.local.json",
+                report_dir=cfg.get("report_dir", ".quality_reports"))
+            dataset_quality.save_quality_status(records, path="quality_status.local.json")
+            return records
+        except Exception:
+            return {}
+
+    def _save_quality_records(self):
+        try:
+            import dataset_quality
+            dataset_quality.save_quality_status(
+                self._quality_records, path="quality_status.local.json")
+        except Exception:
+            pass
+
+    def _mark_quality_unchecked(self, name):
+        if not name:
+            return
+        self._quality_records.pop(name, None)
+        self._quality_status[name] = "未检查"
+        self._quality_reports.pop(name, None)
+        self._save_quality_records()
+        self._update_quality_status_cells(name)
+
+    def _sync_quality_status_from_disk(self):
+        changed = []
+        for name, status in list(self._quality_status.items()):
+            if status != "已检查":
+                continue
+            report_dir = self._quality_reports.get(name)
+            if not report_dir or not Path(report_dir).is_dir():
+                changed.append(name)
+        for name in changed:
+            self._mark_quality_unchecked(name)
+        if changed:
+            self.status.setText(f"检查报告已删除，已同步 {len(changed)} 个数据集为未检查。")
 
     # ---- UI construction -------------------------------------------------- #
     def _build_ui(self):
@@ -967,6 +1063,7 @@ class MainWindow(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.verticalHeader().setVisible(False)
+        self.table.cellClicked.connect(self._on_table_cell_clicked)
         self.table.cellDoubleClicked.connect(self._open_row_link)
         self.table.itemSelectionChanged.connect(self._on_dataset_selected)
         hdr = self.table.detail.horizontalHeader()
@@ -1093,6 +1190,13 @@ class MainWindow(QWidget):
         rules_box = QGroupBox("检查规则")
         rules_box.setStyleSheet(green_box_css)
         rul = QVBoxLayout(rules_box)
+        qrow = QHBoxLayout()
+        self.btn_quality_check = QPushButton("执行深度检查")
+        self.btn_quality_check.setToolTip("按需缓存远程文件并生成问题视频切片，耗时操作会在后台执行。")
+        self.btn_quality_check.clicked.connect(self.on_quality_check)
+        qrow.addWidget(self.btn_quality_check)
+        qrow.addStretch(1)
+        rul.addLayout(qrow)
         self.check_tree = self._panel_tree()
         self.check_tree.setRootIsDecorated(True)
         rul.addWidget(self.check_tree, 1)
@@ -2110,6 +2214,9 @@ class MainWindow(QWidget):
                         txt, color = "➖ 0", "#9e9e9e"
                     item = NumericItem(txt, n)
                     item.setForeground(QBrush(QColor(color)))
+                elif key == "__quality_status__":
+                    name = d.get("dataset_name") or ""
+                    item = self._quality_status_item(name)
                 elif key == "__avg_sec__":
                     eps = d.get("total_episodes") or 0
                     hrs = d.get("duration_hours") or 0
@@ -2159,6 +2266,30 @@ class MainWindow(QWidget):
             if datasets else "点「仅拉取统计信息」加载数据集列表。")
         self._apply_filter()
 
+    def _quality_status_item(self, name):
+        status = self._quality_status.get(name, "未检查")
+        item = QTableWidgetItem(status)
+        if status == "已检查":
+            item.setForeground(QBrush(QColor("#2e7d32")))
+            item.setToolTip(f"点击打开检查报告目录:\n{self._quality_reports.get(name, '')}")
+        elif status == "检查中":
+            item.setForeground(QBrush(QColor("#ef8c00")))
+            item.setToolTip("深度检查正在后台执行")
+        else:
+            item.setForeground(QBrush(QColor("#777777")))
+            item.setToolTip("尚未执行深度检查")
+        return item
+
+    def _update_quality_status_cells(self, name):
+        for table in (getattr(self, "table", None), getattr(self, "edit_table", None)):
+            if table is None:
+                continue
+            for row in range(table.rowCount()):
+                first = table.item(row, 0)
+                data = first.data(Qt.UserRole) if first else {}
+                if (data or {}).get("dataset_name") == name:
+                    table.setItem(row, QUALITY_STATUS_COL, self._quality_status_item(name))
+
     def _apply_filter(self):
         q = self.filter_edit.text().strip().lower()
         only_issues = self.only_issues.isChecked()
@@ -2181,6 +2312,22 @@ class MainWindow(QWidget):
             QDesktopServices.openUrl(QUrl(link))
             self.status.setText(f"已打开: {link}")
 
+    def _on_table_cell_clicked(self, row, col):
+        if col != QUALITY_STATUS_COL:
+            return
+        item = self.table.item(row, 0)
+        d = item.data(Qt.UserRole) if item else {}
+        name = (d or {}).get("dataset_name")
+        if self._quality_status.get(name) != "已检查":
+            return
+        report_dir = self._quality_reports.get(name)
+        if report_dir and Path(report_dir).is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(report_dir).resolve())))
+            self.status.setText(f"已打开检查报告: {report_dir}")
+        else:
+            self._mark_quality_unchecked(name)
+            QMessageBox.warning(self, "提示", "检查报告目录不存在或已被删除。")
+
     # ---- Language-annotation Prompt panel (read-only, 方式1 读文件) ----------
     def _selected_dataset(self):
         row = self.table.currentRow()
@@ -2201,6 +2348,8 @@ class MainWindow(QWidget):
         if not d:
             self.prompt_meta.setText("")
             self._show_prompt_empty("选择左侧数据集查看信息。")
+            if hasattr(self, "btn_quality_check"):
+                self.btn_quality_check.setEnabled(False)
             return
 
         name = (d.get("dataset_name") or "").split("/")[-1]
@@ -2214,6 +2363,8 @@ class MainWindow(QWidget):
         # panel is useful for any selected row even before a full pull.
         self.prompt_empty.setVisible(False)
         self.detail_grid.setVisible(True)
+        if hasattr(self, "btn_quality_check"):
+            self.btn_quality_check.setEnabled(True)
 
         n_tasks = self._refresh_tasks(inline_tasks, task_path)
         n_anno_eps, total_eps = self._refresh_annotations(anno_path)
@@ -2227,12 +2378,32 @@ class MainWindow(QWidget):
             bits.append(f"检查 {chk_mod.badge(agg)[0]}")
         self.prompt_meta.setText(" · ".join(bits))
 
+    def _add_check_group(self, title, results):
+        parent = QTreeWidgetItem([title])
+        f = parent.font(0)
+        f.setBold(True)
+        parent.setFont(0, f)
+        self.check_tree.addTopLevelItem(parent)
+        for r in results:
+            line = f"{chk_mod.icon(r.status)} {r.title}: {r.message}"
+            node = QTreeWidgetItem([line])
+            node.setToolTip(0, line)
+            parent.addChild(node)
+            for det in r.details:
+                node.addChild(QTreeWidgetItem([det]))
+            node.setExpanded(True)
+        parent.setExpanded(True)
+        return parent
+
     def _refresh_checks(self, d):
         """Populate the 检查 tree (grouped by provider). Returns the aggregate."""
         self.check_tree.clear()
         results, agg = chk_mod.run_checks(
             d, providers=("custom", "viewer"), cfg=_CHECKS_CFG)
-        provider_cn = {"custom": "自定义检查", "viewer": "Viewer 检查"}
+        provider_cn = {
+            "custom": "自定义检查",
+            "viewer": "Viewer 检查",
+        }
         by_provider = {}
         for r in results:
             by_provider.setdefault(r.provider, []).append(r)
@@ -2240,21 +2411,63 @@ class MainWindow(QWidget):
             group = by_provider.get(provider)
             if not group:
                 continue
-            parent = QTreeWidgetItem([provider_cn.get(provider, provider)])
-            f = parent.font(0)
-            f.setBold(True)
-            parent.setFont(0, f)
-            self.check_tree.addTopLevelItem(parent)
-            for r in group:
-                line = f"{chk_mod.icon(r.status)} {r.title}: {r.message}"
-                node = QTreeWidgetItem([line])
-                node.setToolTip(0, line)
-                parent.addChild(node)
-                for det in r.details:
-                    node.addChild(QTreeWidgetItem([det]))
-                node.setExpanded(True)
-            parent.setExpanded(True)
+            self._add_check_group(provider_cn.get(provider, provider), group)
+        self._quality_group = self._add_check_group(
+            "本地/远程深度检查",
+            [chk_mod.CheckResult(
+                "episode_local_quality", "Episode 级质量定位", "local_quality",
+                chk_mod.SKIP, "等待手动执行。点击「执行深度检查」开始。", [])])
         return agg
+
+    def on_quality_check(self):
+        d = self._selected_dataset()
+        if not d:
+            QMessageBox.warning(self, "提示", "请先在左侧表格选中一个数据集。")
+            return
+        self._start_quality_check(d)
+
+    def _start_quality_check(self, d):
+        self._quality_seq = getattr(self, "_quality_seq", 0) + 1
+        seq = self._quality_seq
+        name = d.get("dataset_name") or ""
+        self._quality_dataset_name = name
+        if name:
+            self._quality_status[name] = "检查中"
+            self._update_quality_status_cells(name)
+        if hasattr(self, "btn_quality_check"):
+            self.btn_quality_check.setEnabled(False)
+        idx = self.check_tree.indexOfTopLevelItem(getattr(self, "_quality_group", None))
+        if idx >= 0:
+            self.check_tree.takeTopLevelItem(idx)
+        self._quality_group = self._add_check_group(
+            "本地/远程深度检查",
+            [chk_mod.CheckResult(
+                "episode_local_quality", "Episode 级质量定位", "local_quality",
+                chk_mod.SKIP, "检查中，GUI 可继续操作...", [])])
+        self.quality_worker = QualityWorker(seq, d, self.token, _CHECKS_CFG)
+        self.quality_worker.done.connect(self._on_quality_done)
+        self.quality_worker.start()
+
+    def _on_quality_done(self, seq, name, results, _agg, report_dir):
+        if name:
+            self._quality_status[name] = "已检查"
+            if report_dir:
+                self._quality_reports[name] = report_dir
+                self._quality_records[name] = {
+                    "status": "已检查",
+                    "report_dir": report_dir,
+                    "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+                }
+                self._save_quality_records()
+            self._update_quality_status_cells(name)
+        if seq != getattr(self, "_quality_seq", None):
+            return
+        idx = self.check_tree.indexOfTopLevelItem(getattr(self, "_quality_group", None))
+        if idx >= 0:
+            self.check_tree.takeTopLevelItem(idx)
+        self._quality_group = self._add_check_group("本地/远程深度检查", results)
+        if hasattr(self, "btn_quality_check"):
+            self.btn_quality_check.setEnabled(True)
 
     # ---- Viewer /report analysis (async → STATISTICS/FILTERING/INSIGHTS) --- #
     _VERDICT_COLOR = {

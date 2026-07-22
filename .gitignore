@@ -3,6 +3,10 @@
 pulls/
 pull_history.local.json
 hf_change_history.local.json
+quality_status.local.json
+.quality_cache/
+.quality_reports/
+**/quality_clips/
 
 # Python virtual env / caches
 .venv/
