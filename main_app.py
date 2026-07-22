@@ -620,12 +620,23 @@ class MainWindow(QWidget):
         self.speed_timer.setInterval(1000)
         self.speed_timer.timeout.connect(self._tick_speed)
 
-        # Trends can render immediately from accumulated history; the 看板
-        # KPI/table stay empty until 统计/拉取.
+        # Render the newest local report immediately so 看板 reflects the last
+        # local pull/stat run without requiring network access on startup.
         self.history = dd.load_history(OUT_DIR)
-        self._refresh_trends()
-        self.status.setText(
-            "就绪：「仅拉取统计信息」(快) / 「下载当前选中数据集」/ 「拉取组织及其下所有数据集」。")
+        report, source = dd.load_latest_local_report(
+            OUT_DIR, self.org_combo.currentText().strip() or dd.ORG)
+        if report:
+            self.report = report
+            self._refresh_all()
+            count = report.get("count", report.get("total_datasets", 0))
+            requested = report.get("requested", count)
+            self.status.setText(
+                f"已加载本地数据: {count}/{requested} "
+                f"个数据集，共 {report.get('total_hours', 0)} 小时  ->  {source}")
+        else:
+            self._refresh_trends()
+            self.status.setText(
+                "就绪：未发现本地拉取数据；可先点「仅拉取统计信息」或「拉取组织及其下所有数据集」。")
         self._refresh_identity()  # populate the login/visibility indicator
 
     # ---- UI construction -------------------------------------------------- #

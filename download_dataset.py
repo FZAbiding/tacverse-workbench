@@ -432,6 +432,40 @@ def load_history(out_dir, history_file=HISTORY_FILE, config_file=CONFIG_FILE):
     return history
 
 
+def load_latest_local_report(out_dir, org=ORG):
+    """Return the newest locally available report without network access.
+
+    Priority: explicit pulls/*/pull_result_*.json, then local history, then a
+    best-effort scan of downloaded pulls/*/<dataset>/meta/info.json directories.
+    """
+    latest = find_latest_report(out_dir)
+    if latest:
+        data = _load_json(latest)
+        if isinstance(data, dict) and data.get("datasets"):
+            return data, str(latest)
+
+    history = load_history(out_dir)
+    if history:
+        report = history[-1]
+        if isinstance(report, dict) and report.get("datasets"):
+            return report, HISTORY_FILE
+
+    summaries = []
+    newest_by_leaf = {}
+    for info in Path(out_dir).glob("*/*/meta/info.json"):
+        dataset_dir = info.parent.parent
+        prev = newest_by_leaf.get(dataset_dir.name)
+        if prev is None or dataset_dir.stat().st_mtime > prev.stat().st_mtime:
+            newest_by_leaf[dataset_dir.name] = dataset_dir
+    for leaf, dataset_dir in sorted(newest_by_leaf.items()):
+        summaries.append(build_summary(f"{org}/{leaf}", str(dataset_dir)))
+    if summaries:
+        latest_time = max((Path(s["local_dir"]).stat().st_mtime for s in summaries), default=None)
+        now = dt.datetime.fromtimestamp(latest_time) if latest_time else dt.datetime.now()
+        return build_report(summaries, [], now, org, len(summaries)), str(Path(out_dir))
+    return None, None
+
+
 def daily_series(history):
     """Collapse history to one snapshot per day (the day's last pull).
 
