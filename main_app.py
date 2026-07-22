@@ -71,7 +71,7 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"  # logos / image assets
 LOGO_PATH = ASSETS_DIR / "logo.png"
 RECENT_ORGS = ["TacVerse", "Xense"]  # seeds the editable org combo
 
-# HF uploader id -> Chinese name lives in the unified config.json ("uploader_names"
+# HF uploader id -> Chinese name lives in config.json ("uploader_names"
 # section — edit that to add people). Ids with no entry render as 未知. Loaded once
 # at startup; edit the file then restart to pick up new names.
 _UPLOADER_NAMES = dd.load_uploader_names()

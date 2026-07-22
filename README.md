@@ -145,9 +145,11 @@ python main_app.py
 
 ## 配置与数据文件
 
-- **`config.json`**（唯一需要维护的配置，随仓库提交）：
+- **`config.json`**（核心配置，随仓库提交）：
   - `uploader_names`：**你手工维护**的 `HF ID -> 中文名` 映射。新增成员在这里加一行 `"hf_id": "中文名"`（改完重启 GUI 生效）；查不到的 ID 在界面显示为 `未知`。
-  - `pull_history`：**程序每次拉取自动追加**的精简历史快照（每日新增 / 趋势的数据源）。因此**克隆仓库的人不需要 `pulls/` 也能看到历史趋势**。
+- **`pull_history.local.json`**（本地运行历史，已被 git 忽略）：
+  - 程序每次拉取 / 统计会自动追加精简历史快照，作为每日新增 / 趋势的数据源。
+  - 该文件只保存在本机，不提交到仓库，避免泄露或误同步数据集统计历史。
 - **`pulls/`**：拉取下来的原始数据集（含多 GB 视频），**已被 git 忽略**，不随代码同步，以节省仓库体积。
 
 ---
@@ -159,4 +161,5 @@ python main_app.py
 - `checks.py` —— 数据集质量检查插件注册表（命名 / 均时长 / Prompt 等规则）。
 - `dataset_editor.py` —— 「改名 / 改 Prompt」的本地 pyarrow 实现（Qt-free，不依赖 lerobot）。
 - `lerobot_ops.py` / `lerobot_ops_runner.py` —— 删除 / 拆分 / 合并 / 增删特征：workbench 侧封装 + 调用 lerobot `dataset_tools` 的子进程执行器。
-- `config.json` —— 上传者中文名映射 + 质量检查阈值 + 拉取历史（唯一配置文件）。
+- `config.json` —— 上传者中文名映射 + 质量检查阈值。
+- `pull_history.local.json` —— 本地拉取 / 统计历史（自动生成，git 忽略）。

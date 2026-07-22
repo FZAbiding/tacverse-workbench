@@ -284,10 +284,10 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
         out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         log(f"Wrote summary -> {out_path}")
     try:
-        append_history(report)  # git-committed history; survives pulls/ being ignored
-        log(f"Updated history -> {CONFIG_FILE}")
+        history_path = append_history(report)
+        log(f"Updated history -> {history_path}")
     except OSError as exc:
-        log(f"WARN: could not update {CONFIG_FILE}: {exc}")
+        log(f"WARN: could not update {HISTORY_FILE}: {exc}")
     return report, out_path
 
 
@@ -336,14 +336,11 @@ def find_latest_report(out_dir):
 # --------------------------------------------------------------------------- #
 # Analytics helpers (pure functions over report dicts — used by the GUI)
 # --------------------------------------------------------------------------- #
-# Single git-committed config file at the repo root. Holds BOTH the hand-edited
-# uploader id->name map AND the auto-appended pull history, so the project keeps
-# only one json to maintain. It travels with the code — a fresh clone gets the
-# collection trend / 每日新增 WITHOUT syncing the multi-GB pulls/ folder (ignored).
-#
-#   { "uploader_names": { "<hf_id>": "<中文名>", ... },   # you edit this
-#     "pull_history":  [ {trimmed pull snapshot}, ... ] }  # the app appends this
+# The git-committed config file stores only hand-edited settings. Pull history is
+# runtime data and stays in a local ignored file to avoid exposing or constantly
+# changing dataset snapshots in commits.
 CONFIG_FILE = str(Path(__file__).parent / "config.json")
+HISTORY_FILE = str(Path(__file__).parent / "pull_history.local.json")
 
 # Per-dataset fields kept in the lightweight history (drop link/local_dir paths).
 _HISTORY_DS_FIELDS = (
@@ -352,13 +349,18 @@ _HISTORY_DS_FIELDS = (
 )
 
 
-def load_config(path=CONFIG_FILE):
-    """Read the unified config; returns {} (never raises) if missing/corrupt."""
+def _load_json(path):
+    """Read a JSON file; returns None if missing/corrupt."""
     try:
-        cfg = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cfg if isinstance(cfg, dict) else {}
+        return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return None
+
+
+def load_config(path=CONFIG_FILE):
+    """Read the committed config; returns {} if missing/corrupt."""
+    cfg = _load_json(path)
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def load_uploader_names(path=CONFIG_FILE):
@@ -367,7 +369,7 @@ def load_uploader_names(path=CONFIG_FILE):
 
 
 def _trim_report(report):
-    """A compact, path-free copy of a report for the history in the config file."""
+    """A compact, path-free copy of a report for the local history file."""
     return {
         "pulled_at": report.get("pulled_at"),
         "date": report.get("date"),
@@ -381,33 +383,43 @@ def _trim_report(report):
     }
 
 
-def append_history(report, path=CONFIG_FILE):
-    """Fold a trimmed snapshot of `report` into config["pull_history"].
+def load_history_file(path=HISTORY_FILE):
+    """Read local history; accepts the current list format and old dict format."""
+    data = _load_json(path)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("pull_history", []) or []
+    return []
 
-    Re-reads the file first so the hand-edited uploader_names (and any other
-    keys) are preserved. Dedupes by pulled_at and keeps history oldest-first.
+
+def append_history(report, path=HISTORY_FILE, legacy_config_file=CONFIG_FILE):
+    """Fold a trimmed snapshot of `report` into the local history file.
+
+    If the local file does not exist yet, seed it from the old config
+    `pull_history` field for one-time backward compatibility.
     """
-    cfg = load_config(path)
-    hist = cfg.get("pull_history", []) or []
+    hist = load_history_file(path)
+    if not hist and not Path(path).exists():
+        hist = load_config(legacy_config_file).get("pull_history", []) or []
     snap = _trim_report(report)
     hist = [h for h in hist if h.get("pulled_at") != snap.get("pulled_at")]
     hist.append(snap)
     hist.sort(key=lambda r: r.get("pulled_at") or "")
-    cfg["pull_history"] = hist
-    cfg.setdefault("uploader_names", {})  # keep the section present for editors
-    Path(path).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    Path(path).write_text(json.dumps(hist, indent=2, ensure_ascii=False) + "\n")
     return path
 
 
-def load_history(out_dir, config_file=CONFIG_FILE):
+def load_history(out_dir, history_file=HISTORY_FILE, config_file=CONFIG_FILE):
     """Load pull snapshots oldest-first for trends / deltas.
 
-    Merges config["pull_history"] (committed) with any local
-    pulls/*/pull_result_*.json still on disk, deduping by pulled_at so both
-    sources contribute but neither double-counts.
+    Merges the local history file, any legacy config["pull_history"], and any
+    pulls/*/pull_result_*.json still on disk, deduping by pulled_at.
     """
     by_at = {}
     for r in load_config(config_file).get("pull_history", []) or []:
+        by_at[r.get("pulled_at") or id(r)] = r
+    for r in load_history_file(history_file):
         by_at[r.get("pulled_at") or id(r)] = r
     for f in sorted(Path(out_dir).glob("*/pull_result_*.json")):
         try:
