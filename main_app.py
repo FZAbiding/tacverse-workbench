@@ -1163,7 +1163,7 @@ class MainWindow(QWidget):
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
         cv = QVBoxLayout(card)
-        t = QLabel("HF 更新 MVP ⭐")
+        t = QLabel("HF 今日 MVP ⭐")
         t.setStyleSheet("color: #666; font-size: 12px;")
         self.mvp_name_lbl = QLabel("—")
         self.mvp_name_lbl.setStyleSheet(
