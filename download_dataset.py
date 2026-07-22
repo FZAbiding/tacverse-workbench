@@ -918,6 +918,119 @@ def hf_change_group_totals(change_history, key_fn, date=None):
     return rows
 
 
+def _repo_change_rows(change_history, repo_id):
+    repo = (change_history or {}).get("repos", {}).get(repo_id, {})
+    return repo.get("changes", []) or []
+
+
+def _repo_cache_matches(change_history, dataset):
+    repo_id = dataset.get("dataset_name")
+    repo = (change_history or {}).get("repos", {}).get(repo_id, {})
+    return bool(repo.get("changes")) and repo.get("last_modified") == dataset.get("last_modified")
+
+
+def hf_last_modified_dataset_deltas(current_report, history, change_history):
+    """Per-dataset additions with HF last_modified as the date authority.
+
+    Priority for numeric deltas:
+    1. Matching HF commit-diff cache for this dataset and last_modified date.
+    2. Local snapshot delta for datasets not covered by the HF cache.
+
+    Local snapshots are therefore only a fallback, never the primary source when
+    a matching HF commit cache exists.
+    """
+    if not current_report:
+        return {}
+    local_deltas = compute_deltas(current_report, history)
+    out = {}
+    for dataset in current_report.get("datasets", []) or []:
+        name = dataset.get("dataset_name")
+        if not name:
+            continue
+        date = _hf_update_date(dataset)
+        if not date:
+            continue
+        if _repo_cache_matches(change_history, dataset):
+            rows = [row for row in _repo_change_rows(change_history, name)
+                    if row.get("date") == date]
+            hours = round(sum(row.get("hours") or 0 for row in rows), 3)
+            episodes = sum(row.get("episodes") or 0 for row in rows)
+            frames = sum(row.get("frames") or 0 for row in rows)
+        else:
+            delta = local_deltas.get(name, {})
+            hours = max(0, delta.get("d_hours", 0) or 0)
+            episodes = max(0, delta.get("d_episodes", 0) or 0)
+            frames = max(0, delta.get("d_frames", 0) or 0)
+        out[name] = {
+            "date": date,
+            "d_hours": round(hours, 3),
+            "d_episodes": episodes,
+            "d_frames": frames,
+            "is_new": bool(local_deltas.get(name, {}).get("is_new")),
+        }
+    return out
+
+
+def hf_last_modified_daily_group_series(current_report, history, change_history, key_fn):
+    """Daily group additions using HF last_modified for date attribution."""
+    deltas = hf_last_modified_dataset_deltas(current_report, history, change_history)
+    by_name = {dataset.get("dataset_name"): dataset
+               for dataset in (current_report or {}).get("datasets", [])}
+    groups = {}
+    for name, delta in deltas.items():
+        hours = max(0, delta.get("d_hours", 0) or 0)
+        episodes = max(0, delta.get("d_episodes", 0) or 0)
+        frames = max(0, delta.get("d_frames", 0) or 0)
+        if hours <= 0 and episodes <= 0 and frames <= 0:
+            continue
+        dataset = by_name.get(name, {})
+        date = delta.get("date") or ""
+        if not date:
+            continue
+        key = key_fn(dataset) or "—"
+        group = groups.setdefault(
+            (date, key), {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0})
+        group["hours"] += hours
+        group["episodes"] += episodes
+        group["datasets"] += 1
+    rows = list(groups.values())
+    for row in rows:
+        row["hours"] = round(row["hours"], 3)
+    rows.sort(key=lambda row: (row["date"], -row["hours"], row["group"]))
+    return rows
+
+
+def hf_last_modified_latest_date(current_report):
+    datasets = (current_report or {}).get("datasets", [])
+    return max((_hf_update_date(dataset) for dataset in datasets if _hf_update_date(dataset)), default="")
+
+
+def hf_last_modified_totals(current_report, history, change_history, date=None):
+    date = date or hf_last_modified_latest_date(current_report)
+    totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
+    if not date:
+        return totals
+    rows = hf_last_modified_daily_group_series(
+        current_report, history, change_history, lambda dataset: "__all__")
+    for row in rows:
+        if row.get("date") != date:
+            continue
+        totals["hours"] += row.get("hours") or 0
+        totals["episodes"] += row.get("episodes") or 0
+        totals["datasets"] += row.get("datasets") or 0
+    totals["hours"] = round(totals["hours"], 2)
+    return totals
+
+
+def hf_last_modified_group_totals(current_report, history, change_history, key_fn, date=None):
+    date = date or hf_last_modified_latest_date(current_report)
+    rows = [row for row in hf_last_modified_daily_group_series(
+        current_report, history, change_history, key_fn) if row.get("date") == date]
+    rows.sort(key=lambda row: row["hours"], reverse=True)
+    return rows
+
+
 def find_baseline(current_report, history):
     """Return the snapshot to diff `current_report` against: the last pull of the
     most recent *earlier day*.
