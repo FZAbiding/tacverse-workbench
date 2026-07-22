@@ -341,6 +341,7 @@ def find_latest_report(out_dir):
 # changing dataset snapshots in commits.
 CONFIG_FILE = str(Path(__file__).parent / "config.json")
 HISTORY_FILE = str(Path(__file__).parent / "pull_history.local.json")
+CHANGE_HISTORY_FILE = str(Path(__file__).parent / "hf_change_history.local.json")
 
 # Per-dataset fields kept in the lightweight history (drop link/local_dir paths).
 _HISTORY_DS_FIELDS = (
@@ -391,6 +392,21 @@ def load_history_file(path=HISTORY_FILE):
     if isinstance(data, dict):
         return data.get("pull_history", []) or []
     return []
+
+
+def load_hf_change_history(path=CHANGE_HISTORY_FILE):
+    """Read local Hugging Face commit-diff history cache."""
+    data = _load_json(path)
+    if isinstance(data, dict):
+        data.setdefault("version", 1)
+        data.setdefault("repos", {})
+        return data
+    return {"version": 1, "repos": {}}
+
+
+def save_hf_change_history(data, path=CHANGE_HISTORY_FILE):
+    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return path
 
 
 def append_history(report, path=HISTORY_FILE, legacy_config_file=CONFIG_FILE):
@@ -697,6 +713,209 @@ def hf_update_delta_group_totals(current_report, history, key_fn, date=None):
     out = [row for row in rows if row["date"] == date]
     out.sort(key=lambda row: row["hours"], reverse=True)
     return out
+
+
+def _commit_value(commit, *names):
+    for name in names:
+        if isinstance(commit, dict) and commit.get(name) is not None:
+            return commit.get(name)
+        if hasattr(commit, name):
+            value = getattr(commit, name)
+            if value is not None:
+                return value
+    return None
+
+
+def _commit_created_at(commit):
+    value = _commit_value(commit, "created_at", "createdAt", "date")
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value) if value else ""
+
+
+def _yymmdd_from_iso(value):
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%y%m%d")
+    except (TypeError, ValueError):
+        text = str(value or "")[:10]
+        return text.replace("-", "")[2:] if len(text) >= 10 else ""
+
+
+def _commit_id(commit):
+    return _commit_value(commit, "commit_id", "commitId", "oid", "id") or ""
+
+
+def _summary_from_info(repo_id, info):
+    summary = {"dataset_name": repo_id, "link": HF_DATASET_URL.format(repo_id=repo_id)}
+    _apply_info(summary, info or {})
+    return summary
+
+
+def _fetch_info_at_revision(repo_id, revision, token=None):
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(
+        repo_id=repo_id,
+        filename="meta/info.json",
+        repo_type="dataset",
+        revision=revision,
+        token=token,
+    )
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _dataset_meta_for_change(dataset):
+    return {
+        "dataset_name": dataset.get("dataset_name"),
+        "uploader": dataset.get("uploader"),
+        "robot_type": dataset.get("robot_type"),
+        "total_tasks": dataset.get("total_tasks"),
+        "last_modified": dataset.get("last_modified"),
+    }
+
+
+def build_hf_change_rows(repo_id, dataset, token=None):
+    """Build true HF data-growth rows from commit history and meta/info.json diffs."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    try:
+        commits = api.list_repo_commits(repo_id=repo_id, repo_type="dataset", token=token)
+    except TypeError:
+        commits = api.list_repo_commits(repo_id=repo_id, repo_type="dataset")
+    commits = sorted(commits, key=lambda commit: _commit_created_at(commit) or "")
+    prev = None
+    rows = []
+    meta = _dataset_meta_for_change(dataset)
+    for commit in commits:
+        commit_id = _commit_id(commit)
+        created_at = _commit_created_at(commit)
+        if not commit_id or not created_at:
+            continue
+        try:
+            summary = _summary_from_info(repo_id, _fetch_info_at_revision(repo_id, commit_id, token))
+        except Exception:
+            continue
+        frames = summary.get("total_frames") or 0
+        episodes = summary.get("total_episodes") or 0
+        hours = summary.get("duration_hours") or 0
+        prev_frames = prev.get("total_frames") or 0 if prev else 0
+        prev_episodes = prev.get("total_episodes") or 0 if prev else 0
+        prev_hours = prev.get("duration_hours") or 0 if prev else 0
+        d_frames = frames - prev_frames
+        d_episodes = episodes - prev_episodes
+        d_hours = round(hours - prev_hours, 3)
+        prev = summary
+        if d_frames <= 0 and d_episodes <= 0 and d_hours <= 0:
+            continue
+        date = _yymmdd_from_iso(created_at)
+        if not date:
+            continue
+        row = {
+            **meta,
+            "date": date,
+            "commit_id": commit_id,
+            "created_at": created_at,
+            "hours": max(0, d_hours),
+            "episodes": max(0, d_episodes),
+            "frames": max(0, d_frames),
+        }
+        rows.append(row)
+    return rows, commits[-1] if commits else None
+
+
+def update_hf_change_history(report, token=None, path=CHANGE_HISTORY_FILE, log=None, progress=None):
+    """Update local HF commit-diff cache for datasets in `report`."""
+    cache = load_hf_change_history(path)
+    repos = cache.setdefault("repos", {})
+    datasets = report.get("datasets", []) if report else []
+    total = len(datasets)
+    for index, dataset in enumerate(datasets, 1):
+        repo_id = dataset.get("dataset_name")
+        if not repo_id:
+            continue
+        cached = repos.get(repo_id, {})
+        if cached.get("last_modified") == dataset.get("last_modified") and cached.get("changes"):
+            if progress:
+                progress(index, total)
+            continue
+        if log:
+            log(f"HF 变更历史 [{index}/{total}] {repo_id}")
+        try:
+            changes, head = build_hf_change_rows(repo_id, dataset, token)
+        except Exception as exc:
+            cached["error"] = str(exc)
+            repos[repo_id] = cached
+            if progress:
+                progress(index, total)
+            continue
+        repos[repo_id] = {
+            "dataset_name": repo_id,
+            "last_modified": dataset.get("last_modified"),
+            "head_commit": _commit_id(head) if head else "",
+            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "changes": changes,
+        }
+        if progress:
+            progress(index, total)
+    save_hf_change_history(cache, path)
+    return cache
+
+
+def hf_change_rows(change_history):
+    rows = []
+    for repo in (change_history or {}).get("repos", {}).values():
+        rows.extend(repo.get("changes", []) or [])
+    rows.sort(key=lambda row: (row.get("date") or "", row.get("created_at") or ""))
+    return rows
+
+
+def hf_change_daily_group_series(change_history, key_fn):
+    groups = {}
+    for row in hf_change_rows(change_history):
+        date = row.get("date") or ""
+        if not date:
+            continue
+        key = key_fn(row) or "—"
+        group = groups.setdefault(
+            (date, key), {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0, "_dataset_names": set()})
+        group["hours"] += row.get("hours") or 0
+        group["episodes"] += row.get("episodes") or 0
+        group["_dataset_names"].add(row.get("dataset_name") or row.get("commit_id") or id(row))
+    out = list(groups.values())
+    for row in out:
+        row["hours"] = round(row["hours"], 3)
+        row["datasets"] = len(row.pop("_dataset_names"))
+    out.sort(key=lambda row: (row["date"], -row["hours"], row["group"]))
+    return out
+
+
+def hf_change_latest_date(change_history):
+    return max((row.get("date") for row in hf_change_rows(change_history) if row.get("date")), default="")
+
+
+def hf_change_totals(change_history, date=None):
+    date = date or hf_change_latest_date(change_history)
+    totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
+    dataset_names = set()
+    for row in hf_change_rows(change_history):
+        if row.get("date") != date:
+            continue
+        totals["hours"] += row.get("hours") or 0
+        totals["episodes"] += row.get("episodes") or 0
+        dataset_names.add(row.get("dataset_name") or row.get("commit_id") or id(row))
+    totals["hours"] = round(totals["hours"], 2)
+    totals["datasets"] = len(dataset_names)
+    return totals
+
+
+def hf_change_group_totals(change_history, key_fn, date=None):
+    date = date or hf_change_latest_date(change_history)
+    rows = [row for row in hf_change_daily_group_series(change_history, key_fn)
+            if row.get("date") == date]
+    rows.sort(key=lambda row: row["hours"], reverse=True)
+    return rows
 
 
 def find_baseline(current_report, history):

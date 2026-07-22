@@ -455,6 +455,8 @@ class PullWorker(QThread):
                 meta_map=meta_map, with_uploader=True,
                 log=self.log.emit, progress=lambda d, t: self.progress.emit(d, t),
             )
+            self.log.emit("更新 Hugging Face 变更历史缓存 ...")
+            dd.update_hf_change_history(report, token=self.token, log=self.log.emit)
             self.done.emit(report, str(out_path) if out_path else "")
         except Exception as exc:
             self.error.emit(str(exc))
@@ -509,6 +511,8 @@ class StatsWorker(QThread):
                 meta_map=meta_map, with_uploader=True,
                 log=self.log.emit, progress=lambda d, t: self.progress.emit(d, t),
             )
+            self.log.emit("更新 Hugging Face 变更历史缓存 ...")
+            dd.update_hf_change_history(report, token=self.token, log=self.log.emit)
             self.done.emit(report)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -717,6 +721,7 @@ class MainWindow(QWidget):
         # Render the newest local report immediately so 看板 reflects the last
         # local pull/stat run without requiring network access on startup.
         self.history = dd.load_history(OUT_DIR)
+        self.hf_changes = dd.load_hf_change_history()
         report, source = dd.load_latest_local_report(
             OUT_DIR, self.org_combo.currentText().strip() or dd.ORG)
         if report:
@@ -906,10 +911,10 @@ class MainWindow(QWidget):
     KPI_CARDS = [
         ("total_datasets", "数据集总数", False),
         ("total_episodes", "总 episodes", False),
-        ("new_episodes", "HF更新日新增ep", False),
+        ("new_episodes", "今日新增episodes", False),
         ("total_frames", "总 frames", False),
         ("total_hours", "总小时数", True),
-        ("new_hours", "HF更新日新增小时", False),
+        ("new_hours", "今日新增小时", False),
         ("completion", "目标完成度", False),
     ]
 
@@ -1163,7 +1168,7 @@ class MainWindow(QWidget):
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
         cv = QVBoxLayout(card)
-        t = QLabel("HF 今日 MVP ⭐")
+        t = QLabel("今日 MVP ⭐")
         t.setStyleSheet("color: #666; font-size: 12px;")
         self.mvp_name_lbl = QLabel("—")
         self.mvp_name_lbl.setStyleSheet(
@@ -1208,14 +1213,14 @@ class MainWindow(QWidget):
         split = QSplitter(Qt.Vertical)
         split.setChildrenCollapsible(False)
 
-        daily_group_box = QGroupBox("HF 单组单日更新总时长")
+        daily_group_box = QGroupBox("单组单日新增总时长")
         daily_group_v = QVBoxLayout(daily_group_box)
-        self.daily_group_hint = QLabel("按 Hugging Face 最后更新时间分日，随当前分组维度统计更新小时。")
+        self.daily_group_hint = QLabel("按 Hugging Face commit history 分日，随当前分组维度统计真实新增小时。")
         self.daily_group_hint.setStyleSheet("color:#888; font-size:12px;")
         daily_group_v.addWidget(self.daily_group_hint)
         self.daily_group_table = QTableWidget(0, 5)
         self.daily_group_table.setHorizontalHeaderLabels(
-            ["HF更新日期", "分组", "增量小时", "增量episodes", "数据集数"])
+            ["日期", "分组", "新增小时", "新增episodes", "数据集数"])
         self.daily_group_table.setSortingEnabled(True)
         self.daily_group_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.daily_group_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2009,19 +2014,14 @@ class MainWindow(QWidget):
         return dd.compute_deltas(self.report, self.history)
 
     def _refresh_baseline_hint(self):
-        """Spell out the Hugging Face update-day basis for dashboard highlights."""
-        datasets = (self.report or {}).get("datasets", [])
-        date = dd.hf_latest_update_date(datasets)
-        totals = dd.hf_update_delta_totals(self.report, self.history)
-        if not date:
-            self.baseline_hint.setText("暂无 HF last_modified 数据，无法按 Hugging Face 更新日统计。")
-            return
+        """Spell out the Hugging Face commit-diff basis for dashboard highlights."""
+        totals = dd.hf_change_totals(self.hf_changes)
         if not totals.get("date"):
             self.baseline_hint.setText(
-                "暂无可对比的详细历史快照；为避免旧数据被算作新增，HF 今日统计暂不计入。")
+                "暂无 HF commit 变更历史缓存；执行「仅拉取统计信息」后可按真实提交差分统计今日新增。")
             return
         self.baseline_hint.setText(
-            f"「HF更新日小时 / MVP」= 相较于上一份详细历史快照的增量，按 HF last_modified={fmt_day(totals['date'])} 归因。")
+            f"「今日新增 / MVP」= HF commit history 中 {fmt_day(totals['date'])} 的 meta/info.json 增量。")
 
     def _refresh_kpis(self):
         r = self.report
@@ -2047,7 +2047,7 @@ class MainWindow(QWidget):
         self.kpi_labels["completion"].setText(pct)
 
     def _hf_update_totals(self):
-        return dd.hf_update_delta_totals(self.report, self.history)
+        return dd.hf_change_totals(self.hf_changes)
 
     def _new_totals(self, deltas):
         """(new_hours, new_episodes) since the baseline day.
@@ -2069,12 +2069,12 @@ class MainWindow(QWidget):
 
     def _refresh_mvp(self, date):
         """MVP by HF update day: top uploader among datasets updated that day."""
-        rows = dd.hf_update_delta_group_totals(
-            self.report, self.history, lambda dataset: uploader_cn(dataset.get("uploader")), date)
+        rows = dd.hf_change_group_totals(
+            self.hf_changes, lambda row: uploader_cn(row.get("uploader")), date)
         top = rows[0] if rows else None
         if not top or top["hours"] <= 0:
             self.mvp_name_lbl.setText("—")
-            self.mvp_sub_lbl.setText("暂无 HF 当日更新贡献")
+            self.mvp_sub_lbl.setText("今日暂无新增贡献")
             return
         self.mvp_name_lbl.setText(top["group"])
         self.mvp_sub_lbl.setText(
@@ -2549,10 +2549,10 @@ class MainWindow(QWidget):
         self.daily_group_table.setSortingEnabled(False)
         self.daily_group_table.setRowCount(len(rows))
         if not rows:
-            self.daily_group_hint.setText(f"暂无可归因到「{dim}」的 Hugging Face 每日更新数据。")
+            self.daily_group_hint.setText(f"暂无可归因到「{dim}」的 HF commit 每日新增数据。")
         else:
             self.daily_group_hint.setText(
-                f"按 Hugging Face last_modified 日期归因，只统计每个「{dim}」分组相对上一份详细快照的增量。")
+                f"按 HF commit 中 meta/info.json 的真实增量，统计每个「{dim}」分组每日新增小时。")
         for i, row in enumerate(rows):
             values = [
                 fmt_day(row.get("date")),
@@ -2575,7 +2575,7 @@ class MainWindow(QWidget):
         self.rollup_plot.clear()
         dim = self.dim_combo.currentText()
         key_fn = ROLLUP_DIMS[dim]
-        daily_rows = dd.hf_daily_group_delta_series(self.report, self.history, key_fn)
+        daily_rows = dd.hf_change_daily_group_series(self.hf_changes, key_fn)
         self._refresh_daily_group_table(daily_rows, dim)
         if not self.report:
             return
@@ -2827,6 +2827,7 @@ class MainWindow(QWidget):
         self._stop_speed()
         self.report = report
         self.history = dd.load_history(OUT_DIR)  # new snapshot just written
+        self.hf_changes = dd.load_hf_change_history()
         self._refresh_all()
         self._set_busy(False)
         fails = len(report.get("failures", []))
@@ -2845,6 +2846,7 @@ class MainWindow(QWidget):
         try:
             dd.append_history(report)
             self.history = dd.load_history(OUT_DIR)
+            self.hf_changes = dd.load_hf_change_history()
         except OSError as exc:
             hist_note = f"（历史未写入: {exc}）"
         self._refresh_all()

@@ -14,9 +14,9 @@
 - **仅统计**（快）：只读取每个数据集的 `meta/info.json`（不下载数据文件），秒级获得 episodes / frames / 时长等统计。
 - **检查新增**：对比 Hub 与本地的数据集名称，列出新增 / 缺失。
 - **团队看板 GUI**（PySide6），页签：
-  - **看板**：KPI 卡片（数据集总数 / 总小时 / 总 episodes / HF 更新日新增小时 / HF 更新日新增 episodes / 目标完成度 / **HF 今日 MVP ⭐**）+ 可排序筛选的数据集表格（含 **均时长(s)** 质量指标、robot_type、任务数、HF ID、上传者中文名、最后更新、今日新增）。表格默认按 HF「最近更新」排序，和网页一致。
+  - **看板**：KPI 卡片（数据集总数 / 总小时 / 总 episodes / 今日新增小时 / 今日新增 episodes / 目标完成度 / **今日 MVP ⭐**）+ 可排序筛选的数据集表格（含 **均时长(s)** 质量指标、robot_type、任务数、HF ID、上传者中文名、最后更新、今日新增）。表格默认按 HF「最近更新」排序，和网页一致。
   - **趋势**：每日新增小时（柱，仅显示实际拉取过的日期，不留空白）+ 累计小时（折线）。
-  - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠），并按 Hugging Face `last_modified` 展示当前维度下的单组单日增量时长。
+  - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠），并基于 Hugging Face commit history 展示当前维度下的单组单日新增总时长。
   - **数据集编辑**：左侧是与看板一致的数据集详情表（选中要操作的数据集）；右侧两组功能——① **改名 / 改 Prompt**（本地 pyarrow 生成新副本，可推送回 Hub）；② 调用 lerobot 官方 `dataset_tools` 的 **删除 episodes / 拆分 / 合并 / 增加特征 / 删除特征**。详见下方[「数据集编辑」](#数据集编辑生成新副本不改动原数据)。
   - **Viewer**：内嵌 `xense_lerobot_viewer`（Next.js），3D 回放 / 语言标注 / 标签编辑。
 - **质量检查**：命名规范、均时长（20~600s）、Prompt 词数（10~50 词）等规则内置，看板表格用 ✅/⚠️/❌ 标注；阈值在 `config.json` 的 `checks` 段可调。
@@ -150,6 +150,9 @@ python main_app.py
 - **`pull_history.local.json`**（本地运行历史，已被 git 忽略）：
   - 程序每次拉取 / 统计会自动追加精简历史快照，作为每日新增 / 趋势的数据源。
   - 该文件只保存在本机，不提交到仓库，避免泄露或误同步数据集统计历史。
+- **`hf_change_history.local.json`**（本地 HF 变更历史，已被 git 忽略）：
+  - 程序统计 Hugging Face commit history 中 `meta/info.json` 的差分，作为今日新增 / MVP / 单组单日新增的数据源。
+  - 该文件只保存在本机，不提交到仓库，避免同步提交历史统计细节。
 - **`pulls/`**：拉取下来的原始数据集（含多 GB 视频），**已被 git 忽略**，不随代码同步，以节省仓库体积。
 
 ---
@@ -163,3 +166,4 @@ python main_app.py
 - `lerobot_ops.py` / `lerobot_ops_runner.py` —— 删除 / 拆分 / 合并 / 增删特征：workbench 侧封装 + 调用 lerobot `dataset_tools` 的子进程执行器。
 - `config.json` —— 上传者中文名映射 + 质量检查阈值。
 - `pull_history.local.json` —— 本地拉取 / 统计历史（自动生成，git 忽略）。
+- `hf_change_history.local.json` —— 本地 Hugging Face 变更历史缓存（自动生成，git 忽略）。
