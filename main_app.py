@@ -906,10 +906,10 @@ class MainWindow(QWidget):
     KPI_CARDS = [
         ("total_datasets", "数据集总数", False),
         ("total_episodes", "总 episodes", False),
-        ("new_episodes", "HF更新日episodes", False),
+        ("new_episodes", "HF更新日新增ep", False),
         ("total_frames", "总 frames", False),
         ("total_hours", "总小时数", True),
-        ("new_hours", "HF更新日小时", False),
+        ("new_hours", "HF更新日新增小时", False),
         ("completion", "目标完成度", False),
     ]
 
@@ -1215,7 +1215,7 @@ class MainWindow(QWidget):
         daily_group_v.addWidget(self.daily_group_hint)
         self.daily_group_table = QTableWidget(0, 5)
         self.daily_group_table.setHorizontalHeaderLabels(
-            ["HF更新日期", "分组", "更新小时", "episodes", "数据集数"])
+            ["HF更新日期", "分组", "增量小时", "增量episodes", "数据集数"])
         self.daily_group_table.setSortingEnabled(True)
         self.daily_group_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.daily_group_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2012,11 +2012,16 @@ class MainWindow(QWidget):
         """Spell out the Hugging Face update-day basis for dashboard highlights."""
         datasets = (self.report or {}).get("datasets", [])
         date = dd.hf_latest_update_date(datasets)
+        totals = dd.hf_update_delta_totals(self.report, self.history)
         if not date:
-            self.baseline_hint.setText("「今日新增」暂无 HF last_modified 数据，无法按 Hugging Face 更新日统计。")
+            self.baseline_hint.setText("暂无 HF last_modified 数据，无法按 Hugging Face 更新日统计。")
+            return
+        if not totals.get("date"):
+            self.baseline_hint.setText(
+                "暂无可对比的详细历史快照；为避免旧数据被算作新增，HF 今日统计暂不计入。")
             return
         self.baseline_hint.setText(
-            f"「HF更新日小时 / MVP」= HF last_modified 属于 {fmt_day(date)} 的数据集总量。")
+            f"「HF更新日小时 / MVP」= 相较于上一份详细历史快照的增量，按 HF last_modified={fmt_day(totals['date'])} 归因。")
 
     def _refresh_kpis(self):
         r = self.report
@@ -2042,8 +2047,7 @@ class MainWindow(QWidget):
         self.kpi_labels["completion"].setText(pct)
 
     def _hf_update_totals(self):
-        datasets = (self.report or {}).get("datasets", [])
-        return dd.hf_update_totals(datasets)
+        return dd.hf_update_delta_totals(self.report, self.history)
 
     def _new_totals(self, deltas):
         """(new_hours, new_episodes) since the baseline day.
@@ -2065,9 +2069,8 @@ class MainWindow(QWidget):
 
     def _refresh_mvp(self, date):
         """MVP by HF update day: top uploader among datasets updated that day."""
-        datasets = (self.report or {}).get("datasets", [])
-        rows = dd.hf_update_group_totals(
-            datasets, lambda dataset: uploader_cn(dataset.get("uploader")), date)
+        rows = dd.hf_update_delta_group_totals(
+            self.report, self.history, lambda dataset: uploader_cn(dataset.get("uploader")), date)
         top = rows[0] if rows else None
         if not top or top["hours"] <= 0:
             self.mvp_name_lbl.setText("—")
@@ -2549,7 +2552,7 @@ class MainWindow(QWidget):
             self.daily_group_hint.setText(f"暂无可归因到「{dim}」的 Hugging Face 每日更新数据。")
         else:
             self.daily_group_hint.setText(
-                f"按 Hugging Face last_modified 日期，统计每个「{dim}」分组当天更新的数据集总小时。")
+                f"按 Hugging Face last_modified 日期归因，只统计每个「{dim}」分组相对上一份详细快照的增量。")
         for i, row in enumerate(rows):
             values = [
                 fmt_day(row.get("date")),
@@ -2572,8 +2575,7 @@ class MainWindow(QWidget):
         self.rollup_plot.clear()
         dim = self.dim_combo.currentText()
         key_fn = ROLLUP_DIMS[dim]
-        datasets = self.report.get("datasets", []) if self.report else []
-        daily_rows = dd.hf_daily_group_series(datasets, key_fn)
+        daily_rows = dd.hf_daily_group_delta_series(self.report, self.history, key_fn)
         self._refresh_daily_group_table(daily_rows, dim)
         if not self.report:
             return

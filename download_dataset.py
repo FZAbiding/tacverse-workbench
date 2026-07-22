@@ -636,6 +636,69 @@ def hf_update_group_totals(datasets, key_fn, date=None):
     return rows
 
 
+def hf_daily_group_delta_series(current_report, history, key_fn):
+    """Incremental HF update rows grouped by last_modified day and dimension.
+
+    Existing datasets contribute only their positive growth versus the previous
+    detailed baseline snapshot. New datasets contribute their full current size.
+    If no detailed baseline exists, returns [] rather than treating old data as
+    new, because the true increment cannot be known safely.
+    """
+    prior = find_baseline(current_report, history)
+    if not prior or not prior.get("datasets"):
+        return []
+    deltas = compute_deltas(current_report, history)
+    groups = {}
+    for dataset in current_report.get("datasets", []) if current_report else []:
+        name = dataset.get("dataset_name")
+        if not name:
+            continue
+        delta = deltas.get(name, {})
+        hours = max(0, delta.get("d_hours", 0) or 0)
+        episodes = max(0, delta.get("d_episodes", 0) or 0)
+        if hours <= 0 and episodes <= 0:
+            continue
+        date = _hf_update_date(dataset)
+        if not date:
+            continue
+        key = key_fn(dataset) or "—"
+        group = groups.setdefault(
+            (date, key), {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0})
+        group["hours"] += hours
+        group["episodes"] += episodes
+        group["datasets"] += 1
+    rows = list(groups.values())
+    for row in rows:
+        row["hours"] = round(row["hours"], 3)
+    rows.sort(key=lambda row: (row["date"], -row["hours"], row["group"]))
+    return rows
+
+
+def hf_update_delta_totals(current_report, history, date=None):
+    """Incremental totals for one HF update day; defaults to newest delta day."""
+    rows = hf_daily_group_delta_series(current_report, history, lambda dataset: "__all__")
+    date = date or max((row["date"] for row in rows), default="")
+    totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
+    for row in rows:
+        if row["date"] != date:
+            continue
+        totals["hours"] += row["hours"]
+        totals["episodes"] += row["episodes"]
+        totals["datasets"] += row["datasets"]
+    totals["hours"] = round(totals["hours"], 2)
+    return totals
+
+
+def hf_update_delta_group_totals(current_report, history, key_fn, date=None):
+    """Incremental group totals for one HF update day."""
+    rows = hf_daily_group_delta_series(current_report, history, key_fn)
+    date = date or max((row["date"] for row in rows), default="")
+    out = [row for row in rows if row["date"] == date]
+    out.sort(key=lambda row: row["hours"], reverse=True)
+    return out
+
+
 def find_baseline(current_report, history):
     """Return the snapshot to diff `current_report` against: the last pull of the
     most recent *earlier day*.
