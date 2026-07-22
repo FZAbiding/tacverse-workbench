@@ -143,7 +143,7 @@ pg.setConfigOptions(background="w", foreground="k", antialias=True)
 # Dashboard table columns: (header, dataset key, kind). "__delta__" is special.
 TABLE_COLS = [
     ("数据集", "dataset_name", "str"),
-    ("本地", "__local__", "num"),  # raw files downloaded under pulls/ → openable in viewer
+    ("本地文件", "__local__", "num"),  # raw files downloaded under pulls/ → openable in viewer
     ("episodes", "total_episodes", "num"),
     ("frames", "total_frames", "num"),
     ("小时", "duration_hours", "num"),
@@ -161,6 +161,7 @@ TABLE_COLS = [
 # Column that carries last_modified — the table's default sort key. Derived so it
 # stays correct if columns are inserted/reordered above.
 DATE_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "last_modified")
+LOCAL_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "__local__")
 
 # Order = dropdown order; first entry (上传者) is the default. robot_type last.
 ROLLUP_DIMS = {
@@ -294,7 +295,20 @@ class FrozenFirstColumnTable(QTableWidget):
         self._frozen.setColumnWidth(0, self._frozen_width)
         self.setViewportMargins(self._frozen_width, 0, 0, 0)
         self._update_frozen_geometry()
+        self._frozen.raise_()
         self._frozen.show()
+
+    def refresh_frozen(self):
+        for row in range(self.rowCount()):
+            self._frozen.setRowHidden(row, self.isRowHidden(row))
+            self._frozen.setRowHeight(row, self.rowHeight(row))
+        self._frozen.setColumnWidth(0, self._frozen_width)
+        self._update_frozen_geometry()
+        self._frozen.raise_()
+
+    def setRowHidden(self, row, hide):
+        super().setRowHidden(row, hide)
+        self._frozen.setRowHidden(row, hide)
 
     def _sort_frozen_column(self, column):
         self.sortItems(column, self._sort_order)
@@ -316,6 +330,7 @@ class FrozenFirstColumnTable(QTableWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._update_frozen_geometry()
+        self._frozen.raise_()
 
     def scrollTo(self, index, hint=QAbstractItemView.EnsureVisible):
         if index.column() > 0:
@@ -649,11 +664,13 @@ class MainWindow(QWidget):
         toolbar_v.setSpacing(4)
         top = QHBoxLayout()
         aux = QHBoxLayout()
-        for row in (top, aux):
+        status_row = QHBoxLayout()
+        for row in (top, aux, status_row):
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(6)
         toolbar_v.addLayout(top)
         toolbar_v.addLayout(aux)
+        toolbar_v.addLayout(status_row)
 
         def fit_button(button, min_width=0):
             button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -754,37 +771,34 @@ class MainWindow(QWidget):
             aux.addWidget(b)
 
         aux.addStretch()
+
+        status_row.addWidget(vline())
         self.btn_account = QPushButton("切换账号")
         self.btn_account.setStyleSheet(secondary_css)
         self.btn_account.clicked.connect(self.on_switch_account)
         fit_button(self.btn_account)
-        aux.addWidget(self.btn_account)
+        status_row.addWidget(self.btn_account)
         # Login / visibility indicator — surfaces token & org-permission problems
         # (e.g. "未登录(匿名) · TacVerse 可见 11 个") without any digging.
         self.identity_label = QLabel("登录状态: 检测中…")
         self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.identity_label.setStyleSheet("color:#888;")
         self.identity_label.setMinimumWidth(220)
-        aux.addWidget(self.identity_label)
+        status_row.addWidget(self.identity_label)
+        status_row.addStretch()
 
         # Live clock, far right.
-        aux.addWidget(vline())
+        status_row.addWidget(vline())
         self.clock_label = QLabel("")
         self.clock_label.setStyleSheet("color:#444; font-weight:bold;")
         self.clock_label.setMinimumWidth(160)
-        aux.addWidget(self.clock_label)
+        status_row.addWidget(self.clock_label)
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self._tick_clock)
         self.clock_timer.start(1000)
         self._tick_clock()
-        toolbar_scroll = QScrollArea()
-        toolbar_scroll.setFrameShape(QFrame.NoFrame)
-        toolbar_scroll.setWidgetResizable(False)
-        toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        toolbar_scroll.setMaximumHeight(toolbar.sizeHint().height() + 18)
-        toolbar_scroll.setWidget(toolbar)
-        root.addWidget(toolbar_scroll)
+        toolbar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        root.addWidget(toolbar)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_dashboard_tab(), "看板")
@@ -863,6 +877,8 @@ class MainWindow(QWidget):
         # 数据集详情 (table)
         self.table = FrozenFirstColumnTable(0, len(TABLE_COLS), frozen_width=440)
         self.table.setHorizontalHeaderLabels([c[0] for c in TABLE_COLS])
+        self.table.horizontalHeaderItem(LOCAL_COL).setToolTip(
+            "本地文件表示原始数据是否已下载到 pulls/，已下载的数据集可在 Viewer 打开。")
         self.table.setSortingEnabled(True)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1138,6 +1154,8 @@ class MainWindow(QWidget):
         summary = QWidget()
         summary_v = QVBoxLayout(summary)
         summary_v.setContentsMargins(0, 0, 0, 0)
+        summary_split = QSplitter(Qt.Vertical)
+        summary_split.setChildrenCollapsible(False)
 
         self.rollup_table = QTableWidget(0, 5)
         self.rollup_table.setHorizontalHeaderLabels(
@@ -1146,10 +1164,14 @@ class MainWindow(QWidget):
         self.rollup_table.verticalHeader().setVisible(False)
         self.rollup_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.Stretch)
-        summary_v.addWidget(self.rollup_table)
+        summary_split.addWidget(self.rollup_table)
         self.rollup_plot = pg.PlotWidget(title="各分组小时数")
         self.rollup_plot.showGrid(x=False, y=True, alpha=0.3)
-        summary_v.addWidget(self.rollup_plot)
+        summary_split.addWidget(self.rollup_plot)
+        summary_split.setStretchFactor(0, 2)
+        summary_split.setStretchFactor(1, 3)
+        summary_split.setSizes([320, 480])
+        summary_v.addWidget(summary_split, 1)
         split.addWidget(summary)
         split.setStretchFactor(0, 2)
         split.setStretchFactor(1, 3)
@@ -1194,6 +1216,8 @@ class MainWindow(QWidget):
 
         self.edit_table = QTableWidget(0, len(TABLE_COLS))
         self.edit_table.setHorizontalHeaderLabels([c[0] for c in TABLE_COLS])
+        self.edit_table.horizontalHeaderItem(LOCAL_COL).setToolTip(
+            "本地文件表示原始数据是否已下载到 pulls/，已下载的数据集可编辑或在 Viewer 打开。")
         self.edit_table.setSortingEnabled(True)
         self.edit_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.edit_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2054,6 +2078,8 @@ class MainWindow(QWidget):
         table.setSortingEnabled(True)
         # Default order: most-recently-updated first (matches org page / 发现顺序).
         table.sortItems(DATE_COL, Qt.DescendingOrder)
+        if isinstance(table, FrozenFirstColumnTable):
+            table.refresh_frozen()
 
     def _refresh_table(self):
         r = self.report
@@ -2075,7 +2101,8 @@ class MainWindow(QWidget):
         q = self.filter_edit.text().strip().lower()
         only_issues = self.only_issues.isChecked()
         for row in range(self.table.rowCount()):
-            d = self.table.item(row, 0).data(Qt.UserRole) or {}
+            data_item = self.table.item(row, 0)
+            d = data_item.data(Qt.UserRole) if data_item else {}
             hay = " ".join(str(d.get(k, "")) for k in
                            ("dataset_name", "robot_type", "uploader")).lower()
             hay += " " + uploader_cn(d.get("uploader")).lower()
