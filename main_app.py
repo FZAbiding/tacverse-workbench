@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QStackedWidget,
-    QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
+    QSplitter, QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -255,6 +255,79 @@ class NumericItem(QTableWidgetItem):
         if isinstance(other, NumericItem):
             return self.sort_key < other.sort_key
         return super().__lt__(other)
+
+
+class FrozenFirstColumnTable(QTableWidget):
+    """QTableWidget with column 0 pinned while the rest scrolls horizontally."""
+
+    def __init__(self, rows=0, columns=0, parent=None, frozen_width=440):
+        super().__init__(rows, columns, parent)
+        self._frozen_width = frozen_width
+        self._frozen = QTableView(self)
+        self._frozen.setModel(self.model())
+        self._frozen.setSelectionModel(self.selectionModel())
+        self._frozen.setFocusPolicy(Qt.NoFocus)
+        self._frozen.setFrameShape(QFrame.NoFrame)
+        self._frozen.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._frozen.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._frozen.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._frozen.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._frozen.verticalHeader().hide()
+        self._frozen.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self._frozen.horizontalHeader().sectionClicked.connect(self._sort_frozen_column)
+        self._frozen.doubleClicked.connect(
+            lambda index: self.cellDoubleClicked.emit(index.row(), index.column()))
+        self.horizontalHeader().sectionResized.connect(self._update_frozen_width)
+        self.verticalHeader().sectionResized.connect(self._update_frozen_row_height)
+        self.verticalScrollBar().valueChanged.connect(
+            self._frozen.verticalScrollBar().setValue)
+        self._frozen.verticalScrollBar().valueChanged.connect(
+            self.verticalScrollBar().setValue)
+        self._sort_order = Qt.AscendingOrder
+
+    def freeze_first_column(self, width=None):
+        if width is not None:
+            self._frozen_width = width
+        for column in range(self.columnCount()):
+            self._frozen.setColumnHidden(column, column != 0)
+        self.hideColumn(0)
+        self._frozen.setColumnWidth(0, self._frozen_width)
+        self.setViewportMargins(self._frozen_width, 0, 0, 0)
+        self._update_frozen_geometry()
+        self._frozen.show()
+
+    def _sort_frozen_column(self, column):
+        self.sortItems(column, self._sort_order)
+        self._sort_order = (Qt.DescendingOrder
+                            if self._sort_order == Qt.AscendingOrder
+                            else Qt.AscendingOrder)
+
+    def _update_frozen_width(self, column, old_size, new_size):
+        if column != 0:
+            return
+        self._frozen_width = new_size
+        self._frozen.setColumnWidth(0, new_size)
+        self.setViewportMargins(new_size, 0, 0, 0)
+        self._update_frozen_geometry()
+
+    def _update_frozen_row_height(self, row, old_size, new_size):
+        self._frozen.setRowHeight(row, new_size)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_frozen_geometry()
+
+    def scrollTo(self, index, hint=QAbstractItemView.EnsureVisible):
+        if index.column() > 0:
+            super().scrollTo(index, hint)
+
+    def _update_frozen_geometry(self):
+        self._frozen.setGeometry(
+            self.verticalHeader().width() + self.frameWidth(),
+            self.frameWidth(),
+            self._frozen_width,
+            self.viewport().height() + self.horizontalHeader().height(),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -756,7 +829,7 @@ class MainWindow(QWidget):
         lv.addLayout(filt)
 
         # 数据集详情 (table)
-        self.table = QTableWidget(0, len(TABLE_COLS))
+        self.table = FrozenFirstColumnTable(0, len(TABLE_COLS), frozen_width=440)
         self.table.setHorizontalHeaderLabels([c[0] for c in TABLE_COLS])
         self.table.setSortingEnabled(True)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -770,6 +843,7 @@ class MainWindow(QWidget):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         hdr.setStretchLastSection(True)
         self.table.setColumnWidth(0, 440)
+        self.table.freeze_first_column(440)
         lv.addWidget(self.table, 1)
         self.table_hint = QLabel("点「仅拉取统计信息」加载数据集列表(双击行打开 HF 页面)。")
         lv.addWidget(self.table_hint)
