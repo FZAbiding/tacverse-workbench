@@ -16,7 +16,7 @@
 - **团队看板 GUI**（PySide6），页签：
   - **看板**：KPI 卡片（数据集总数 / 总小时 / 总 episodes / 今日新增小时 / 今日新增 episodes / 目标完成度 / **今日 MVP ⭐**）+ 可排序筛选的数据集表格（含 **均时长(s)** 质量指标、robot_type、任务数、HF ID、上传者中文名、最后更新、今日新增）。表格默认按 HF「最近更新」排序，和网页一致。
   - **趋势**：每日新增小时（柱，仅显示实际拉取过的日期，不留空白）+ 累计小时（折线）。
-  - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠）。
+  - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠），并以 Hugging Face `last_modified` 归日、优先使用 commit history 差分、缺失时用本地快照兜底展示单组单日新增总时长。
   - **数据集编辑**：左侧是与看板一致的数据集详情表（选中要操作的数据集）；右侧两组功能——① **改名 / 改 Prompt**（本地 pyarrow 生成新副本，可推送回 Hub）；② 调用 lerobot 官方 `dataset_tools` 的 **删除 episodes / 拆分 / 合并 / 增加特征 / 删除特征**。详见下方[「数据集编辑」](#数据集编辑生成新副本不改动原数据)。
   - **Viewer**：内嵌 `xense_lerobot_viewer`（Next.js），3D 回放 / 语言标注 / 标签编辑。
 - **质量检查**：命名规范、均时长（20~600s）、Prompt 词数（10~50 词）等规则内置，看板表格用 ✅/⚠️/❌ 标注；阈值在 `config.json` 的 `checks` 段可调。
@@ -145,9 +145,14 @@ python main_app.py
 
 ## 配置与数据文件
 
-- **`config.json`**（唯一需要维护的配置，随仓库提交）：
+- **`config.json`**（核心配置，随仓库提交）：
   - `uploader_names`：**你手工维护**的 `HF ID -> 中文名` 映射。新增成员在这里加一行 `"hf_id": "中文名"`（改完重启 GUI 生效）；查不到的 ID 在界面显示为 `未知`。
-  - `pull_history`：**程序每次拉取自动追加**的精简历史快照（每日新增 / 趋势的数据源）。因此**克隆仓库的人不需要 `pulls/` 也能看到历史趋势**。
+- **`pull_history.local.json`**（本地运行历史，已被 git 忽略）：
+  - 程序每次拉取 / 统计会自动追加精简历史快照，作为每日新增 / 趋势的数据源。
+  - 该文件只保存在本机，不提交到仓库，避免泄露或误同步数据集统计历史。
+- **`hf_change_history.local.json`**（本地 HF 变更历史，已被 git 忽略）：
+  - 程序统计 Hugging Face commit history 中 `meta/info.json` 的差分，作为今日新增 / MVP / 单组单日新增的优先数值来源；缺失项才使用本地快照辅助兜底。
+  - 该文件只保存在本机，不提交到仓库，避免同步提交历史统计细节。
 - **`pulls/`**：拉取下来的原始数据集（含多 GB 视频），**已被 git 忽略**，不随代码同步，以节省仓库体积。
 
 ---
@@ -159,4 +164,6 @@ python main_app.py
 - `checks.py` —— 数据集质量检查插件注册表（命名 / 均时长 / Prompt 等规则）。
 - `dataset_editor.py` —— 「改名 / 改 Prompt」的本地 pyarrow 实现（Qt-free，不依赖 lerobot）。
 - `lerobot_ops.py` / `lerobot_ops_runner.py` —— 删除 / 拆分 / 合并 / 增删特征：workbench 侧封装 + 调用 lerobot `dataset_tools` 的子进程执行器。
-- `config.json` —— 上传者中文名映射 + 质量检查阈值 + 拉取历史（唯一配置文件）。
+- `config.json` —— 上传者中文名映射 + 质量检查阈值。
+- `pull_history.local.json` —— 本地拉取 / 统计历史（自动生成，git 忽略）。
+- `hf_change_history.local.json` —— 本地 Hugging Face 变更历史缓存（自动生成，git 忽略）。

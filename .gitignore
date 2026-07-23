@@ -1,7 +1,12 @@
 # Pulled datasets are huge (multi-GB video/parquet) — never commit the raw data.
-# The lightweight collection history (每日新增 / 趋势) lives in the git-committed
-# root file ./pull_history.json instead, so a clone gets history without pulls/.
+# Lightweight collection history (每日新增 / 趋势) is local runtime data.
 pulls/
+pull_history.local.json
+hf_change_history.local.json
+quality_status.local.json
+.quality_cache/
+.quality_reports/
+**/quality_clips/
 
 # Python virtual env / caches
 .venv/

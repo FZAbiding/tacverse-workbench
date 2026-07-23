@@ -160,10 +160,11 @@ def discover_datasets_meta(org, token):
     """
     from huggingface_hub import list_datasets
 
-    # Ask the Hub for its own "Recently updated" ranking (sort by lastModified,
-    # newest first) so our order matches the org page exactly. The client-side
-    # sort below is a stable fallback that also pins timestamp-less repos last.
-    ds = list(list_datasets(author=org, token=token, sort="lastModified", direction=-1))
+    # Ask the Hub for its own "Recently updated" ranking when available; older
+    # huggingface_hub versions (e.g. 1.23.x) do not expose a `direction` kwarg,
+    # so we sort client-side as the source of truth and also pin timestamp-less
+    # repos last.
+    ds = list(list_datasets(author=org, token=token, sort="lastModified"))
     ds.sort(key=lambda d: (d.last_modified is not None, d.last_modified), reverse=True)
     out = []
     for d in ds:
@@ -283,10 +284,10 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
         out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         log(f"Wrote summary -> {out_path}")
     try:
-        append_history(report)  # git-committed history; survives pulls/ being ignored
-        log(f"Updated history -> {CONFIG_FILE}")
+        history_path = append_history(report)
+        log(f"Updated history -> {history_path}")
     except OSError as exc:
-        log(f"WARN: could not update {CONFIG_FILE}: {exc}")
+        log(f"WARN: could not update {HISTORY_FILE}: {exc}")
     return report, out_path
 
 
@@ -335,14 +336,12 @@ def find_latest_report(out_dir):
 # --------------------------------------------------------------------------- #
 # Analytics helpers (pure functions over report dicts — used by the GUI)
 # --------------------------------------------------------------------------- #
-# Single git-committed config file at the repo root. Holds BOTH the hand-edited
-# uploader id->name map AND the auto-appended pull history, so the project keeps
-# only one json to maintain. It travels with the code — a fresh clone gets the
-# collection trend / 每日新增 WITHOUT syncing the multi-GB pulls/ folder (ignored).
-#
-#   { "uploader_names": { "<hf_id>": "<中文名>", ... },   # you edit this
-#     "pull_history":  [ {trimmed pull snapshot}, ... ] }  # the app appends this
+# The git-committed config file stores only hand-edited settings. Pull history is
+# runtime data and stays in a local ignored file to avoid exposing or constantly
+# changing dataset snapshots in commits.
 CONFIG_FILE = str(Path(__file__).parent / "config.json")
+HISTORY_FILE = str(Path(__file__).parent / "pull_history.local.json")
+CHANGE_HISTORY_FILE = str(Path(__file__).parent / "hf_change_history.local.json")
 
 # Per-dataset fields kept in the lightweight history (drop link/local_dir paths).
 _HISTORY_DS_FIELDS = (
@@ -351,13 +350,18 @@ _HISTORY_DS_FIELDS = (
 )
 
 
-def load_config(path=CONFIG_FILE):
-    """Read the unified config; returns {} (never raises) if missing/corrupt."""
+def _load_json(path):
+    """Read a JSON file; returns None if missing/corrupt."""
     try:
-        cfg = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cfg if isinstance(cfg, dict) else {}
+        return json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return None
+
+
+def load_config(path=CONFIG_FILE):
+    """Read the committed config; returns {} if missing/corrupt."""
+    cfg = _load_json(path)
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def load_uploader_names(path=CONFIG_FILE):
@@ -366,7 +370,7 @@ def load_uploader_names(path=CONFIG_FILE):
 
 
 def _trim_report(report):
-    """A compact, path-free copy of a report for the history in the config file."""
+    """A compact, path-free copy of a report for the local history file."""
     return {
         "pulled_at": report.get("pulled_at"),
         "date": report.get("date"),
@@ -380,43 +384,102 @@ def _trim_report(report):
     }
 
 
-def append_history(report, path=CONFIG_FILE):
-    """Fold a trimmed snapshot of `report` into config["pull_history"].
+def load_history_file(path=HISTORY_FILE):
+    """Read local history; accepts the current list format and old dict format."""
+    data = _load_json(path)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("pull_history", []) or []
+    return []
 
-    Re-reads the file first so the hand-edited uploader_names (and any other
-    keys) are preserved. Dedupes by pulled_at and keeps history oldest-first.
+
+def load_hf_change_history(path=CHANGE_HISTORY_FILE):
+    """Read local Hugging Face commit-diff history cache."""
+    data = _load_json(path)
+    if isinstance(data, dict):
+        data.setdefault("version", 1)
+        data.setdefault("repos", {})
+        return data
+    return {"version": 1, "repos": {}}
+
+
+def save_hf_change_history(data, path=CHANGE_HISTORY_FILE):
+    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    return path
+
+
+def append_history(report, path=HISTORY_FILE, legacy_config_file=CONFIG_FILE):
+    """Fold a trimmed snapshot of `report` into the local history file.
+
+    If the local file does not exist yet, seed it from the old config
+    `pull_history` field for one-time backward compatibility.
     """
-    cfg = load_config(path)
-    hist = cfg.get("pull_history", []) or []
+    hist = load_history_file(path)
+    if not hist and not Path(path).exists():
+        hist = load_config(legacy_config_file).get("pull_history", []) or []
     snap = _trim_report(report)
     hist = [h for h in hist if h.get("pulled_at") != snap.get("pulled_at")]
     hist.append(snap)
     hist.sort(key=lambda r: r.get("pulled_at") or "")
-    cfg["pull_history"] = hist
-    cfg.setdefault("uploader_names", {})  # keep the section present for editors
-    Path(path).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    Path(path).write_text(json.dumps(hist, indent=2, ensure_ascii=False) + "\n")
     return path
 
 
-def load_history(out_dir, config_file=CONFIG_FILE):
+def load_history(out_dir, history_file=HISTORY_FILE, config_file=CONFIG_FILE):
     """Load pull snapshots oldest-first for trends / deltas.
 
-    Merges config["pull_history"] (committed) with any local
-    pulls/*/pull_result_*.json still on disk, deduping by pulled_at so both
-    sources contribute but neither double-counts.
+    Merges the local history file, any legacy config["pull_history"], and any
+    pulls/*/pull_result_*.json still on disk, deduping by pulled_at.
     """
     by_at = {}
     for r in load_config(config_file).get("pull_history", []) or []:
+        by_at[r.get("pulled_at") or id(r)] = r
+    for r in load_history_file(history_file):
         by_at[r.get("pulled_at") or id(r)] = r
     for f in sorted(Path(out_dir).glob("*/pull_result_*.json")):
         try:
             r = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        by_at.setdefault(r.get("pulled_at") or str(f), r)  # config wins on ties
+        by_at.setdefault(r.get("pulled_at") or str(f), r)  # history file wins on ties
     history = list(by_at.values())
     history.sort(key=lambda r: r.get("pulled_at", ""))
     return history
+
+
+def load_latest_local_report(out_dir, org=ORG):
+    """Return the newest locally available report without network access.
+
+    Priority: explicit pulls/*/pull_result_*.json, then local history, then a
+    best-effort scan of downloaded pulls/*/<dataset>/meta/info.json directories.
+    """
+    latest = find_latest_report(out_dir)
+    if latest:
+        data = _load_json(latest)
+        if isinstance(data, dict) and data.get("datasets"):
+            return data, str(latest)
+
+    history = load_history(out_dir)
+    if history:
+        report = history[-1]
+        if isinstance(report, dict) and report.get("datasets"):
+            return report, HISTORY_FILE
+
+    summaries = []
+    newest_by_leaf = {}
+    for info in Path(out_dir).glob("*/*/meta/info.json"):
+        dataset_dir = info.parent.parent
+        prev = newest_by_leaf.get(dataset_dir.name)
+        if prev is None or dataset_dir.stat().st_mtime > prev.stat().st_mtime:
+            newest_by_leaf[dataset_dir.name] = dataset_dir
+    for leaf, dataset_dir in sorted(newest_by_leaf.items()):
+        summaries.append(build_summary(f"{org}/{leaf}", str(dataset_dir)))
+    if summaries:
+        latest_time = max((Path(s["local_dir"]).stat().st_mtime for s in summaries), default=None)
+        now = dt.datetime.fromtimestamp(latest_time) if latest_time else dt.datetime.now()
+        return build_report(summaries, [], now, org, len(summaries)), str(Path(out_dir))
+    return None, None
 
 
 def daily_series(history):
@@ -447,6 +510,525 @@ def daily_series(history):
             "total_datasets": r.get("total_datasets", 0) or 0,
         })
     return series
+
+
+def daily_group_series(history, key_fn):
+    """Per-group daily positive growth from the last snapshot of each day.
+
+    Returns rows sorted by date oldest-first and hours descending within each day:
+    {date, group, hours, episodes, datasets}. The first detailed day counts
+    each dataset's full duration as that day's contribution. If the previous day
+    has only aggregate totals and no dataset details, attribution for the next
+    day is skipped because per-group growth cannot be derived safely.
+    """
+    by_day = {}
+    for r in history:
+        by_day[r.get("date", "")] = r
+    rows = []
+    prev_report = None
+    prev = {}
+    for date in sorted(k for k in by_day if k):
+        report = by_day[date]
+        datasets = report.get("datasets", []) or []
+        aggregate_only_prior = bool(prev_report) and not prev
+        if not aggregate_only_prior:
+            groups = {}
+            for dataset in datasets:
+                name = dataset.get("dataset_name")
+                if not name:
+                    continue
+                prior = prev.get(name)
+                d_hours = round((dataset.get("duration_hours") or 0)
+                                - (prior.get("duration_hours") or 0 if prior else 0), 3)
+                d_episodes = (dataset.get("total_episodes") or 0) \
+                    - (prior.get("total_episodes") or 0 if prior else 0)
+                hours = max(0, d_hours)
+                episodes = max(0, d_episodes)
+                if hours <= 0 and episodes <= 0:
+                    continue
+                key = key_fn(dataset) or "—"
+                group = groups.setdefault(
+                    key, {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0})
+                group["hours"] += hours
+                group["episodes"] += episodes
+                group["datasets"] += 1
+            day_rows = sorted(groups.values(), key=lambda g: g["hours"], reverse=True)
+            for row in day_rows:
+                row["hours"] = round(row["hours"], 3)
+            rows.extend(day_rows)
+        prev_report = report
+        prev = {d.get("dataset_name"): d for d in datasets if d.get("dataset_name")}
+    return rows
+
+
+def daily_uploader_series(history):
+    """Backward-compatible per-uploader daily growth helper."""
+    return daily_group_series(history, lambda d: d.get("uploader") or "")
+
+
+def _hf_update_date(dataset):
+    """YYMMDD from a dataset's Hugging Face last_modified timestamp."""
+    value = dataset.get("last_modified")
+    if not value:
+        return ""
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%y%m%d")
+    except (TypeError, ValueError):
+        return str(value)[:10].replace("-", "")[2:]
+
+
+def hf_daily_group_series(datasets, key_fn):
+    """Group current datasets by Hugging Face update day and dimension.
+
+    Uses each dataset's `last_modified` from the Hub rather than local pull
+    snapshots. Returns {date, group, hours, episodes, datasets} sorted by date
+    oldest-first and hours descending within each date.
+    """
+    groups = {}
+    for dataset in datasets or []:
+        date = _hf_update_date(dataset)
+        if not date:
+            continue
+        key = key_fn(dataset) or "—"
+        group = groups.setdefault(
+            (date, key), {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0})
+        group["hours"] += dataset.get("duration_hours") or 0
+        group["episodes"] += dataset.get("total_episodes") or 0
+        group["datasets"] += 1
+    rows = list(groups.values())
+    for row in rows:
+        row["hours"] = round(row["hours"], 3)
+    rows.sort(key=lambda row: (row["date"], -row["hours"], row["group"]))
+    return rows
+
+
+def hf_latest_update_date(datasets):
+    """Newest Hugging Face last_modified date (YYMMDD) in current datasets."""
+    dates = [_hf_update_date(dataset) for dataset in datasets or []]
+    return max((date for date in dates if date), default="")
+
+
+def hf_update_totals(datasets, date=None):
+    """Totals for datasets whose Hugging Face update day equals `date`.
+
+    If date is omitted, uses the newest HF update day in the dataset list.
+    """
+    date = date or hf_latest_update_date(datasets)
+    totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
+    if not date:
+        return totals
+    for dataset in datasets or []:
+        if _hf_update_date(dataset) != date:
+            continue
+        totals["hours"] += dataset.get("duration_hours") or 0
+        totals["episodes"] += dataset.get("total_episodes") or 0
+        totals["datasets"] += 1
+    totals["hours"] = round(totals["hours"], 2)
+    return totals
+
+
+def hf_update_group_totals(datasets, key_fn, date=None):
+    """Group totals for one Hugging Face update day."""
+    date = date or hf_latest_update_date(datasets)
+    groups = {}
+    if not date:
+        return []
+    for dataset in datasets or []:
+        if _hf_update_date(dataset) != date:
+            continue
+        key = key_fn(dataset) or "—"
+        group = groups.setdefault(
+            key, {"date": date, "group": key, "hours": 0.0,
+                  "episodes": 0, "datasets": 0})
+        group["hours"] += dataset.get("duration_hours") or 0
+        group["episodes"] += dataset.get("total_episodes") or 0
+        group["datasets"] += 1
+    rows = list(groups.values())
+    for row in rows:
+        row["hours"] = round(row["hours"], 2)
+    rows.sort(key=lambda row: row["hours"], reverse=True)
+    return rows
+
+
+def hf_daily_group_delta_series(current_report, history, key_fn):
+    """Incremental HF update rows grouped by last_modified day and dimension.
+
+    Existing datasets contribute only their positive growth versus the previous
+    detailed baseline snapshot. New datasets contribute their full current size.
+    If no detailed baseline exists, returns [] rather than treating old data as
+    new, because the true increment cannot be known safely.
+    """
+    prior = find_baseline(current_report, history)
+    if not prior or not prior.get("datasets"):
+        return []
+    deltas = compute_deltas(current_report, history)
+    groups = {}
+    for dataset in current_report.get("datasets", []) if current_report else []:
+        name = dataset.get("dataset_name")
+        if not name:
+            continue
+        delta = deltas.get(name, {})
+        hours = max(0, delta.get("d_hours", 0) or 0)
+        episodes = max(0, delta.get("d_episodes", 0) or 0)
+        if hours <= 0 and episodes <= 0:
+            continue
+        date = _hf_update_date(dataset)
+        if not date:
+            continue
+        key = key_fn(dataset) or "—"
+        group = groups.setdefault(
+            (date, key), {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0})
+        group["hours"] += hours
+        group["episodes"] += episodes
+        group["datasets"] += 1
+    rows = list(groups.values())
+    for row in rows:
+        row["hours"] = round(row["hours"], 3)
+    rows.sort(key=lambda row: (row["date"], -row["hours"], row["group"]))
+    return rows
+
+
+def hf_update_delta_totals(current_report, history, date=None):
+    """Incremental totals for one HF update day; defaults to newest delta day."""
+    rows = hf_daily_group_delta_series(current_report, history, lambda dataset: "__all__")
+    date = date or max((row["date"] for row in rows), default="")
+    totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
+    for row in rows:
+        if row["date"] != date:
+            continue
+        totals["hours"] += row["hours"]
+        totals["episodes"] += row["episodes"]
+        totals["datasets"] += row["datasets"]
+    totals["hours"] = round(totals["hours"], 2)
+    return totals
+
+
+def hf_update_delta_group_totals(current_report, history, key_fn, date=None):
+    """Incremental group totals for one HF update day."""
+    rows = hf_daily_group_delta_series(current_report, history, key_fn)
+    date = date or max((row["date"] for row in rows), default="")
+    out = [row for row in rows if row["date"] == date]
+    out.sort(key=lambda row: row["hours"], reverse=True)
+    return out
+
+
+def _commit_value(commit, *names):
+    for name in names:
+        if isinstance(commit, dict) and commit.get(name) is not None:
+            return commit.get(name)
+        if hasattr(commit, name):
+            value = getattr(commit, name)
+            if value is not None:
+                return value
+    return None
+
+
+def _commit_created_at(commit):
+    value = _commit_value(commit, "created_at", "createdAt", "date")
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value) if value else ""
+
+
+def _yymmdd_from_iso(value):
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%y%m%d")
+    except (TypeError, ValueError):
+        text = str(value or "")[:10]
+        return text.replace("-", "")[2:] if len(text) >= 10 else ""
+
+
+def _commit_id(commit):
+    return _commit_value(commit, "commit_id", "commitId", "oid", "id") or ""
+
+
+def _summary_from_info(repo_id, info):
+    summary = {"dataset_name": repo_id, "link": HF_DATASET_URL.format(repo_id=repo_id)}
+    _apply_info(summary, info or {})
+    return summary
+
+
+def _fetch_info_at_revision(repo_id, revision, token=None):
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(
+        repo_id=repo_id,
+        filename="meta/info.json",
+        repo_type="dataset",
+        revision=revision,
+        token=token,
+    )
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _dataset_meta_for_change(dataset):
+    return {
+        "dataset_name": dataset.get("dataset_name"),
+        "uploader": dataset.get("uploader"),
+        "robot_type": dataset.get("robot_type"),
+        "total_tasks": dataset.get("total_tasks"),
+        "last_modified": dataset.get("last_modified"),
+    }
+
+
+def build_hf_change_rows(repo_id, dataset, token=None):
+    """Build true HF data-growth rows from commit history and meta/info.json diffs."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    try:
+        commits = api.list_repo_commits(repo_id=repo_id, repo_type="dataset", token=token)
+    except TypeError:
+        commits = api.list_repo_commits(repo_id=repo_id, repo_type="dataset")
+    commits = sorted(commits, key=lambda commit: _commit_created_at(commit) or "")
+    prev = None
+    rows = []
+    meta = _dataset_meta_for_change(dataset)
+    for commit in commits:
+        commit_id = _commit_id(commit)
+        created_at = _commit_created_at(commit)
+        if not commit_id or not created_at:
+            continue
+        try:
+            summary = _summary_from_info(repo_id, _fetch_info_at_revision(repo_id, commit_id, token))
+        except Exception:
+            continue
+        frames = summary.get("total_frames") or 0
+        episodes = summary.get("total_episodes") or 0
+        hours = summary.get("duration_hours") or 0
+        prev_frames = prev.get("total_frames") or 0 if prev else 0
+        prev_episodes = prev.get("total_episodes") or 0 if prev else 0
+        prev_hours = prev.get("duration_hours") or 0 if prev else 0
+        d_frames = frames - prev_frames
+        d_episodes = episodes - prev_episodes
+        d_hours = round(hours - prev_hours, 3)
+        prev = summary
+        if d_frames <= 0 and d_episodes <= 0 and d_hours <= 0:
+            continue
+        date = _yymmdd_from_iso(created_at)
+        if not date:
+            continue
+        row = {
+            **meta,
+            "date": date,
+            "commit_id": commit_id,
+            "created_at": created_at,
+            "hours": max(0, d_hours),
+            "episodes": max(0, d_episodes),
+            "frames": max(0, d_frames),
+        }
+        rows.append(row)
+    return rows, commits[-1] if commits else None
+
+
+def update_hf_change_history(report, token=None, path=CHANGE_HISTORY_FILE, log=None, progress=None):
+    """Update local HF commit-diff cache for datasets in `report`."""
+    cache = load_hf_change_history(path)
+    repos = cache.setdefault("repos", {})
+    datasets = report.get("datasets", []) if report else []
+    total = len(datasets)
+    for index, dataset in enumerate(datasets, 1):
+        repo_id = dataset.get("dataset_name")
+        if not repo_id:
+            continue
+        cached = repos.get(repo_id, {})
+        if cached.get("last_modified") == dataset.get("last_modified") and cached.get("changes"):
+            if progress:
+                progress(index, total)
+            continue
+        if log:
+            log(f"HF 变更历史 [{index}/{total}] {repo_id}")
+        try:
+            changes, head = build_hf_change_rows(repo_id, dataset, token)
+        except Exception as exc:
+            cached["error"] = str(exc)
+            repos[repo_id] = cached
+            if progress:
+                progress(index, total)
+            continue
+        repos[repo_id] = {
+            "dataset_name": repo_id,
+            "last_modified": dataset.get("last_modified"),
+            "head_commit": _commit_id(head) if head else "",
+            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "changes": changes,
+        }
+        if progress:
+            progress(index, total)
+    save_hf_change_history(cache, path)
+    return cache
+
+
+def hf_change_rows(change_history):
+    rows = []
+    for repo in (change_history or {}).get("repos", {}).values():
+        rows.extend(repo.get("changes", []) or [])
+    rows.sort(key=lambda row: (row.get("date") or "", row.get("created_at") or ""))
+    return rows
+
+
+def hf_change_daily_group_series(change_history, key_fn):
+    groups = {}
+    for row in hf_change_rows(change_history):
+        date = row.get("date") or ""
+        if not date:
+            continue
+        key = key_fn(row) or "—"
+        group = groups.setdefault(
+            (date, key), {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0, "_dataset_names": set()})
+        group["hours"] += row.get("hours") or 0
+        group["episodes"] += row.get("episodes") or 0
+        group["_dataset_names"].add(row.get("dataset_name") or row.get("commit_id") or id(row))
+    out = list(groups.values())
+    for row in out:
+        row["hours"] = round(row["hours"], 3)
+        row["datasets"] = len(row.pop("_dataset_names"))
+    out.sort(key=lambda row: (row["date"], -row["hours"], row["group"]))
+    return out
+
+
+def hf_change_latest_date(change_history):
+    return max((row.get("date") for row in hf_change_rows(change_history) if row.get("date")), default="")
+
+
+def hf_change_totals(change_history, date=None):
+    date = date or hf_change_latest_date(change_history)
+    totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
+    dataset_names = set()
+    for row in hf_change_rows(change_history):
+        if row.get("date") != date:
+            continue
+        totals["hours"] += row.get("hours") or 0
+        totals["episodes"] += row.get("episodes") or 0
+        dataset_names.add(row.get("dataset_name") or row.get("commit_id") or id(row))
+    totals["hours"] = round(totals["hours"], 2)
+    totals["datasets"] = len(dataset_names)
+    return totals
+
+
+def hf_change_group_totals(change_history, key_fn, date=None):
+    date = date or hf_change_latest_date(change_history)
+    rows = [row for row in hf_change_daily_group_series(change_history, key_fn)
+            if row.get("date") == date]
+    rows.sort(key=lambda row: row["hours"], reverse=True)
+    return rows
+
+
+def _repo_change_rows(change_history, repo_id):
+    repo = (change_history or {}).get("repos", {}).get(repo_id, {})
+    return repo.get("changes", []) or []
+
+
+def _repo_cache_matches(change_history, dataset):
+    repo_id = dataset.get("dataset_name")
+    repo = (change_history or {}).get("repos", {}).get(repo_id, {})
+    return bool(repo.get("changes")) and repo.get("last_modified") == dataset.get("last_modified")
+
+
+def hf_last_modified_dataset_deltas(current_report, history, change_history):
+    """Per-dataset additions with HF last_modified as the date authority.
+
+    Priority for numeric deltas:
+    1. Matching HF commit-diff cache for this dataset and last_modified date.
+    2. Local snapshot delta for datasets not covered by the HF cache.
+
+    Local snapshots are therefore only a fallback, never the primary source when
+    a matching HF commit cache exists.
+    """
+    if not current_report:
+        return {}
+    local_deltas = compute_deltas(current_report, history)
+    out = {}
+    for dataset in current_report.get("datasets", []) or []:
+        name = dataset.get("dataset_name")
+        if not name:
+            continue
+        date = _hf_update_date(dataset)
+        if not date:
+            continue
+        if _repo_cache_matches(change_history, dataset):
+            rows = [row for row in _repo_change_rows(change_history, name)
+                    if row.get("date") == date]
+            hours = round(sum(row.get("hours") or 0 for row in rows), 3)
+            episodes = sum(row.get("episodes") or 0 for row in rows)
+            frames = sum(row.get("frames") or 0 for row in rows)
+        else:
+            delta = local_deltas.get(name, {})
+            hours = max(0, delta.get("d_hours", 0) or 0)
+            episodes = max(0, delta.get("d_episodes", 0) or 0)
+            frames = max(0, delta.get("d_frames", 0) or 0)
+        out[name] = {
+            "date": date,
+            "d_hours": round(hours, 3),
+            "d_episodes": episodes,
+            "d_frames": frames,
+            "is_new": bool(local_deltas.get(name, {}).get("is_new")),
+        }
+    return out
+
+
+def hf_last_modified_daily_group_series(current_report, history, change_history, key_fn):
+    """Daily group additions using HF last_modified for date attribution."""
+    deltas = hf_last_modified_dataset_deltas(current_report, history, change_history)
+    by_name = {dataset.get("dataset_name"): dataset
+               for dataset in (current_report or {}).get("datasets", [])}
+    groups = {}
+    for name, delta in deltas.items():
+        hours = max(0, delta.get("d_hours", 0) or 0)
+        episodes = max(0, delta.get("d_episodes", 0) or 0)
+        frames = max(0, delta.get("d_frames", 0) or 0)
+        if hours <= 0 and episodes <= 0 and frames <= 0:
+            continue
+        dataset = by_name.get(name, {})
+        date = delta.get("date") or ""
+        if not date:
+            continue
+        key = key_fn(dataset) or "—"
+        group = groups.setdefault(
+            (date, key), {"date": date, "group": key, "hours": 0.0,
+                          "episodes": 0, "datasets": 0})
+        group["hours"] += hours
+        group["episodes"] += episodes
+        group["datasets"] += 1
+    rows = list(groups.values())
+    for row in rows:
+        row["hours"] = round(row["hours"], 3)
+    rows.sort(key=lambda row: (row["date"], -row["hours"], row["group"]))
+    return rows
+
+
+def hf_last_modified_latest_date(current_report):
+    datasets = (current_report or {}).get("datasets", [])
+    return max((_hf_update_date(dataset) for dataset in datasets if _hf_update_date(dataset)), default="")
+
+
+def hf_last_modified_totals(current_report, history, change_history, date=None):
+    date = date or hf_last_modified_latest_date(current_report)
+    totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
+    if not date:
+        return totals
+    rows = hf_last_modified_daily_group_series(
+        current_report, history, change_history, lambda dataset: "__all__")
+    for row in rows:
+        if row.get("date") != date:
+            continue
+        totals["hours"] += row.get("hours") or 0
+        totals["episodes"] += row.get("episodes") or 0
+        totals["datasets"] += row.get("datasets") or 0
+    totals["hours"] = round(totals["hours"], 2)
+    return totals
+
+
+def hf_last_modified_group_totals(current_report, history, change_history, key_fn, date=None):
+    date = date or hf_last_modified_latest_date(current_report)
+    rows = [row for row in hf_last_modified_daily_group_series(
+        current_report, history, change_history, key_fn) if row.get("date") == date]
+    rows.sort(key=lambda row: row["hours"], reverse=True)
+    return rows
 
 
 def find_baseline(current_report, history):
