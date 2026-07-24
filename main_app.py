@@ -46,11 +46,11 @@ def _configure_qt_plugin_path():
 _configure_qt_plugin_path()
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, QUrl
+from PySide6.QtCore import QDate, Qt, QThread, QTimer, Signal, QUrl
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QDateEdit, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSpinBox, QStackedWidget,
     QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
@@ -189,6 +189,14 @@ def fmt_day_wd(yymmdd):
         return d.strftime("%m-%d") + "\n周" + "一二三四五六日"[d.weekday()]
     except (ValueError, TypeError):
         return yymmdd or "—"
+
+
+def qdate_from_yymmdd(yymmdd):
+    try:
+        d = dt.datetime.strptime(yymmdd, "%y%m%d")
+        return QDate(d.year, d.month, d.day)
+    except (ValueError, TypeError):
+        return QDate()
 
 
 def days_between(yymmdd_from, yymmdd_to):
@@ -1314,8 +1322,63 @@ class MainWindow(QWidget):
         row.addStretch()
         v.addLayout(row)
 
-        split = QSplitter(Qt.Vertical)
+        split = QSplitter(Qt.Horizontal)
         split.setChildrenCollapsible(False)
+
+        summary_box = QGroupBox("累计分组时长统计")
+        summary_v = QVBoxLayout(summary_box)
+        self.rollup_table = QTableWidget(0, 5)
+        self.rollup_table.setHorizontalHeaderLabels(
+            ["分组", "数据集数", "episodes", "小时", "占比%"])
+        self.rollup_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.rollup_table.verticalHeader().setVisible(False)
+        self.rollup_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.Stretch)
+        summary_v.addWidget(self.rollup_table, 2)
+        self.rollup_plot = pg.PlotWidget(title="各分组小时数")
+        self.rollup_plot.showGrid(x=False, y=True, alpha=0.3)
+        summary_v.addWidget(self.rollup_plot, 3)
+        split.addWidget(summary_box)
+
+        period_box = QGroupBox("指定周期内的分组新增时长")
+        period_v = QVBoxLayout(period_box)
+
+        period_row = QHBoxLayout()
+        period_row.addWidget(QLabel("开始:"))
+        self.period_from = QDateEdit()
+        self.period_from.setCalendarPopup(True)
+        self.period_from.setDisplayFormat("yyyy-MM-dd")
+        self.period_from.setDateRange(QDate(2000, 1, 1), QDate(2099, 12, 31))
+        self.period_from.setDate(QDate.currentDate())
+        period_row.addWidget(self.period_from)
+        period_row.addWidget(QLabel("结束:"))
+        self.period_to = QDateEdit()
+        self.period_to.setCalendarPopup(True)
+        self.period_to.setDisplayFormat("yyyy-MM-dd")
+        self.period_to.setDateRange(QDate(2000, 1, 1), QDate(2099, 12, 31))
+        self.period_to.setDate(QDate.currentDate())
+        period_row.addWidget(self.period_to)
+        self.period_all_btn = QPushButton("全部日期")
+        self.period_all_btn.clicked.connect(self._reset_period_range)
+        period_row.addWidget(self.period_all_btn)
+        period_row.addStretch()
+        period_v.addLayout(period_row)
+
+        self.period_hint = QLabel("按上方时间周期汇总当前分组维度的新增小时。")
+        self.period_hint.setStyleSheet("color:#888; font-size:12px;")
+        period_v.addWidget(self.period_hint)
+        self.period_group_table = QTableWidget(0, 4)
+        self.period_group_table.setHorizontalHeaderLabels(
+            ["分组", "周期新增小时", "新增episodes", "变更数据集次"])
+        self.period_group_table.setSortingEnabled(True)
+        self.period_group_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.period_group_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.period_group_table.verticalHeader().setVisible(False)
+        period_hdr = self.period_group_table.horizontalHeader()
+        period_hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 4):
+            period_hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        period_v.addWidget(self.period_group_table, 1)
 
         daily_group_box = QGroupBox("单组单日新增总时长")
         daily_group_v = QVBoxLayout(daily_group_box)
@@ -1335,33 +1398,25 @@ class MainWindow(QWidget):
         for col in range(2, 5):
             daily_hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         daily_group_v.addWidget(self.daily_group_table, 1)
-        split.addWidget(daily_group_box)
 
-        summary = QWidget()
-        summary_v = QVBoxLayout(summary)
-        summary_v.setContentsMargins(0, 0, 0, 0)
-        summary_split = QSplitter(Qt.Vertical)
-        summary_split.setChildrenCollapsible(False)
+        period_split = QSplitter(Qt.Vertical)
+        period_split.setChildrenCollapsible(False)
+        period_split.addWidget(period_box)
+        period_split.addWidget(daily_group_box)
+        period_split.setStretchFactor(0, 2)
+        period_split.setStretchFactor(1, 3)
+        period_split.setSizes([320, 520])
+        split.addWidget(period_split)
 
-        self.rollup_table = QTableWidget(0, 5)
-        self.rollup_table.setHorizontalHeaderLabels(
-            ["分组", "数据集数", "episodes", "小时", "占比%"])
-        self.rollup_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.rollup_table.verticalHeader().setVisible(False)
-        self.rollup_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Stretch)
-        summary_split.addWidget(self.rollup_table)
-        self.rollup_plot = pg.PlotWidget(title="各分组小时数")
-        self.rollup_plot.showGrid(x=False, y=True, alpha=0.3)
-        summary_split.addWidget(self.rollup_plot)
-        summary_split.setStretchFactor(0, 2)
-        summary_split.setStretchFactor(1, 3)
-        summary_split.setSizes([320, 480])
-        summary_v.addWidget(summary_split, 1)
-        split.addWidget(summary)
-        split.setStretchFactor(0, 2)
-        split.setStretchFactor(1, 3)
-        split.setSizes([360, 760])
+        self._period_daily_rows = []
+        self._period_user_changed = False
+        self._period_updating = False
+        self.period_from.dateChanged.connect(self._on_period_date_changed)
+        self.period_to.dateChanged.connect(self._on_period_date_changed)
+
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([900, 700])
         v.addWidget(split, 1)
         return w
 
@@ -2750,6 +2805,100 @@ class MainWindow(QWidget):
         self.cum_plot.getAxis("bottom").setTicks(ticks)
         self.cum_plot.setXRange(-0.5, len(series) - 0.5, padding=0.02)
 
+    def _sync_period_controls(self, rows):
+        self._period_daily_rows = rows or []
+        dates = sorted({row.get("date") for row in self._period_daily_rows
+                        if qdate_from_yymmdd(row.get("date")).isValid()})
+        if not dates:
+            self.period_group_table.setRowCount(0)
+            self.period_hint.setText("暂无可用于周期统计的分组新增数据。")
+            return
+
+        start_date = qdate_from_yymmdd(dates[0])
+        end_date = qdate_from_yymmdd(dates[-1])
+        self._period_updating = True
+        try:
+            self.period_from.setDateRange(start_date, end_date)
+            self.period_to.setDateRange(start_date, end_date)
+            if not self._period_user_changed:
+                self.period_from.setDate(start_date)
+                self.period_to.setDate(end_date)
+        finally:
+            self._period_updating = False
+        self._refresh_period_rollup()
+
+    def _on_period_date_changed(self, *_):
+        if self._period_updating:
+            return
+        self._period_user_changed = True
+        self._refresh_period_rollup()
+
+    def _reset_period_range(self, *_):
+        self._period_user_changed = False
+        self._sync_period_controls(getattr(self, "_period_daily_rows", []))
+
+    def _refresh_period_rollup(self):
+        rows = getattr(self, "_period_daily_rows", [])
+        self.period_group_table.setSortingEnabled(False)
+        self.period_group_table.setRowCount(0)
+        if not rows:
+            self.period_group_table.setSortingEnabled(True)
+            self.period_hint.setText("暂无可用于周期统计的分组新增数据。")
+            return
+
+        start_date = self.period_from.date()
+        end_date = self.period_to.date()
+        start_j = start_date.toJulianDay()
+        end_j = end_date.toJulianDay()
+        if start_j > end_j:
+            start_j, end_j = end_j, start_j
+            start_date, end_date = end_date, start_date
+
+        groups = {}
+        for row in rows:
+            row_date = qdate_from_yymmdd(row.get("date"))
+            if not row_date.isValid():
+                continue
+            row_j = row_date.toJulianDay()
+            if row_j < start_j or row_j > end_j:
+                continue
+            key = row.get("group") or "—"
+            group = groups.setdefault(
+                key, {"group": key, "hours": 0.0, "episodes": 0, "datasets": 0})
+            group["hours"] += row.get("hours") or 0
+            group["episodes"] += row.get("episodes") or 0
+            group["datasets"] += row.get("datasets") or 0
+
+        period_rows = sorted(groups.values(), key=lambda row: (-row["hours"], row["group"]))
+        self.period_group_table.setRowCount(len(period_rows))
+        for i, row in enumerate(period_rows):
+            values = [
+                row["group"],
+                round(row["hours"], 3),
+                row["episodes"],
+                row["datasets"],
+            ]
+            for j, value in enumerate(values):
+                if j == 0:
+                    item = QTableWidgetItem(str(value))
+                else:
+                    item = NumericItem(fmt_value(value), value)
+                self.period_group_table.setItem(i, j, item)
+        self.period_group_table.setSortingEnabled(True)
+        self.period_group_table.sortItems(1, Qt.DescendingOrder)
+
+        dim = self.dim_combo.currentText()
+        start_text = start_date.toString("yyyy-MM-dd")
+        end_text = end_date.toString("yyyy-MM-dd")
+        if period_rows:
+            total_hours = round(sum(row["hours"] for row in period_rows), 3)
+            self.period_hint.setText(
+                f"{start_text} 至 {end_text}，按「{dim}」汇总 "
+                f"{len(period_rows)} 个分组，共 {fmt_value(total_hours)} 小时。")
+        else:
+            self.period_hint.setText(
+                f"{start_text} 至 {end_text}，暂无可归因到「{dim}」的新增时长。")
+
     def _refresh_daily_group_table(self, rows, dim):
         self.daily_group_table.setSortingEnabled(False)
         self.daily_group_table.setRowCount(len(rows))
@@ -2782,6 +2931,7 @@ class MainWindow(QWidget):
         key_fn = ROLLUP_DIMS[dim]
         daily_rows = dd.hf_last_modified_daily_group_series(
             self.report, self.history, self.hf_changes, key_fn)
+        self._sync_period_controls(daily_rows)
         self._refresh_daily_group_table(daily_rows, dim)
         if not self.report:
             return
